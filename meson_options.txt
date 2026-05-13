@@ -1,0 +1,6 @@
+option('static',
+  type : 'boolean',
+  value : false,
+  description : 'Statically link the binary (-static, -static-libgcc). ' +
+                'Useful when bundling into a busybox initramfs.',
+)
