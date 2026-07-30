@@ -25,3 +25,21 @@ executable('lx2160-sdx',
   link_args : link_args,
   install : true,
 )
+
+executable('lx2160-pcie',
+  'src/lx2160-pcie.c',
+  link_args : link_args,
+  install : true,
+)
+
+executable('lx2160-eth',
+  'src/lx2160-eth.c',
+  link_args : link_args,
+  install : true,
+)
+
+executable('lx2160-sata',
+  'src/lx2160-sata.c',
+  link_args : link_args,
+  install : true,
+)
