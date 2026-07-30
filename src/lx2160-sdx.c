@@ -12,20 +12,6 @@
  *   ./lx2160-sdx --raw                 # raw hex dump of every known register
  *   ./lx2160-sdx --quiet               # one-line "OK / FAIL" summary per lane
  *   ./lx2160-sdx -h                    # full usage
- *
- * References
- *   LX2160ARM.pdf §26 SerDes Module
- *     §26.4 SerDes register descriptions
- *     §26.4.1 SerDes memory map
- *     §26.4.1.1 SerDes Reset Control (RSTCTL)
- *     §26.4.1.2 PLL{F,S}RSTCTL
- *     §26.4.1.3 PLL{F,S}CR0   (LOCK at bit 31)
- *     §26.4.1.4 PLL{F,S}CR1
- *     §26.4.1.12 LNaGCR0
- *     §26.4.1.13 LNaTRSTCTL
- *     §26.4.1.17 LNaRRSTCTL (CDR_LOCK at bit 12)
- *     §26.4.1.18 LNaRGCR0
- *   200827-LX2160A_verB.bsdl SerDes lane ball assignments
  */
 
 #define _DEFAULT_SOURCE
@@ -56,7 +42,7 @@
 #define SD3_BASE        0x01EC0000UL
 #define SD_BLOCK_MAP_LEN 0x1000UL   /* 4 KiB covers all decoded registers (highest = lane 7 RECR4 @ 0xF54) */
 
-/* Block-level register offsets (RM §26.4.1.1 - .11) */
+/* Block-level register offsets */
 #define OFF_RSTCTL          0x000
 #define OFF_PLLFRSTCTL      0x400
 #define OFF_PLLFCR0         0x404
@@ -77,7 +63,7 @@
 #define OFF_PLLSSSCR1       0x530
 #define OFF_PLLSSSCR2       0x534
 
-/* Per-lane register offsets (RM §26.4.1.12+, applied as base + a*0x100)  */
+/* Per-lane register offsets (applied as base + a*0x100)  */
 #define OFF_LANE_GCR0       0x800   /* General Control 0 */
 #define OFF_LANE_TRSTCTL    0x820   /* TX Reset Control */
 #define OFF_LANE_TGCR0      0x824   /* TX General Control 0 */
@@ -101,9 +87,38 @@
 #define PLL_RSTCTL_HLT_REQ      27
 #define PLL_RSTCTL_STP_REQ      26
 #define PLL_RSTCTL_DIS          24
+/*
+ * LOCK lives in PLL[F/S]RSTCTL (offset 0x400/0x500) bit 23: NOT in
+ * PLL[F/S]CR0.
+ * bit 23  LOCK ("Indicates PLLn has calibrated and locked"),
+ * bits 22-0 Reserved.
+ */
+#define PLL_RSTCTL_LOCK         23
 
-/* Bit positions in PLL[F/S]CR0 */
-#define PLL_CR0_LOCK            31
+/*
+ * PLL[F/S]CR0 REFCLK_SEL (bits 20:16): reference-clock frequency
+ * select, the frequency expected on the external
+ * SDn_PLL{F,S}_REF_CLK_P/N pin pair (the SerDes has no internal
+ * refclk source).
+ * PLL[F/S]CR1 FRATE_SEL (bits 28:24): clock-net / VCO rate select.
+ * Both default from the RCW.
+ */
+#define PLL_CR0_REFCLK_SEL_SHIFT 16
+#define PLL_CR0_REFCLK_SEL_MASK  0x1fu
+#define PLL_CR1_FRATE_SEL_SHIFT  24
+#define PLL_CR1_FRATE_SEL_MASK   0x1fu
+
+/*
+ * LNmGCR0: PROTO_SEL bits [7:3] = what the lane is muxed to in
+ * silicon (PCIe/SGMII/SATA/10G-ETH/25G-ETH)
+ *  IF_WIDTH bits [2:0] = PCS parallel width
+ *  PORT_LN0_B bit 16 = 0 on the port's master clock lane
+ */
+#define LN_GCR0_PROTO_SEL_SHIFT 3
+#define LN_GCR0_PROTO_SEL_MASK  0x1fu
+#define LN_GCR0_IF_WIDTH_MASK   0x7u
+#define LN_GCR0_PORT_LN0_B      16
+#define LN_GCR0_PORT_RST_LEFT   17
 
 /* Bit positions in LNaTRSTCTL */
 #define LN_TRSTCTL_RST_REQ      31
@@ -127,7 +142,7 @@ enum mode {
     MODE_RAW,     /* hex dump of every known register, one per line */
 };
 
-/*  Per-block descriptive metadata (Nodebox v3 RCW = 13 / 7 / 3) 
+/* Per-block descriptive metadata (my test case is RCW = 13 / 7 / 3) 
  * Update if you build a different RCW. The text is informational only;
  * the register reads are universal.
  */
@@ -142,7 +157,7 @@ static const struct block_info blocks[3] = {
     {
         .idx     = 1,
         .base    = SD1_BASE,
-        .summary = "SD1 (RCW SRDS_PRTCL_S1=13: 2x 100GE) — routes to J100; awaits 100GE-capable carrier",
+        .summary = "SD1 (RCW SRDS_PRTCL_S1=13: 2x 100GE); awaits 100GE-capable carrier",
         .lane_labels = {
             "100GE.1 lane 0", "100GE.1 lane 1", "100GE.1 lane 2", "100GE.1 lane 3",
             "100GE.2 lane 0", "100GE.2 lane 1", "100GE.2 lane 2", "100GE.2 lane 3",
@@ -154,7 +169,7 @@ static const struct block_info blocks[3] = {
         .summary = "SD2 (RCW SRDS_PRTCL_S2=7: PCIe.3/4 + SGMII + USXGMII)",
         .lane_labels = {
             "PCIe.3 x1 (Gen2)", "SGMII.12", "SGMII.17", "SGMII.18",
-            "PCIe.4 x1 (Gen2)", "SGMII.16", "USXGMII13 (LAN8023)", "USXGMII14 (LAN8023)",
+            "PCIe.4 x1 (Gen2)", "SGMII.16", "USXGMII13", "USXGMII14",
         },
     },
     {
@@ -182,9 +197,90 @@ static const char *yn(uint32_t b) { return b ? "yes" : "no"; }
 
 static const char *checkmark(bool ok) { return ok ? "[OK]" : "[!!]"; }
 
+/* PLLnCR0[REFCLK_SEL] -> refclk frequency */
+static const char *refclk_mhz(uint32_t cr0)
+{
+    switch ((cr0 >> PLL_CR0_REFCLK_SEL_SHIFT) & PLL_CR0_REFCLK_SEL_MASK) {
+    case 0x00: return "100 MHz";
+    case 0x01: return "125 MHz";
+    case 0x02: return "156.25 MHz";
+    case 0x03: return "150 MHz";
+    case 0x04: return "161.1328125 MHz";
+    default:   return "reserved";
+    }
+}
+
+/* PLLnCR1[FRATE_SEL] -> clock-net / VCO rate */
+static const char *frate(uint32_t cr1)
+{
+    switch ((cr1 >> PLL_CR1_FRATE_SEL_SHIFT) & PLL_CR1_FRATE_SEL_MASK) {
+    case 0x00: return "5 GHz clknet / 20 GHz VCO (PLLS only)";
+    case 0x06: return "10.3125 GHz clknet / 20.625 GHz VCO (PLLS only)";
+    case 0x10: return "5 GHz clknet / 25 GHz VCO";
+    case 0x12: return "6 GHz clknet / 24 GHz VCO";
+    case 0x16: return "12.890625 GHz clknet / 25.78125 GHz VCO";
+    case 0x17: return "8 GHz clknet / 24 GHz VCO";
+    case 0x19: return "8 GHz clknet / 16 GHz VCO (PLLF only)";
+    default:   return "reserved";
+    }
+}
+
+/* LNmGCR0[PROTO_SEL] -> the mode the lane is muxed to in silicon. */
+static const char *lane_mode(uint32_t gcr0)
+{
+    switch ((gcr0 >> LN_GCR0_PROTO_SEL_SHIFT) & LN_GCR0_PROTO_SEL_MASK) {
+    case 0x00: return "PCIe";
+    case 0x01: return "ethernet-1G (SGMII/1000Base-KX)";
+    case 0x02: return "SATA";
+    case 0x0a: return "ethernet-10G (XFI/KR/USXGMII/40G)";
+    case 0x1a: return "ethernet-25G (25G/50G/100G lanes)";
+    default:   return "reserved";
+    }
+}
+
+/* Short mode token for the one-line quiet format. */
+static const char *lane_mode_short(uint32_t gcr0)
+{
+    switch ((gcr0 >> LN_GCR0_PROTO_SEL_SHIFT) & LN_GCR0_PROTO_SEL_MASK) {
+    case 0x00: return "PCIe";
+    case 0x01: return "ETH-1G";
+    case 0x02: return "SATA";
+    case 0x0a: return "ETH-10G";
+    case 0x1a: return "ETH-25G";
+    default:   return "rsvd";
+    }
+}
+
+/* Nominal per-lane line rate for the silicon mode (baud, not payload). */
+static const char *lane_rate(uint32_t gcr0)
+{
+    switch ((gcr0 >> LN_GCR0_PROTO_SEL_SHIFT) & LN_GCR0_PROTO_SEL_MASK) {
+    case 0x00: return "2.5/5/8 GT/s (per LTSSM)";
+    case 0x01: return "1.25 Gbd";
+    case 0x02: return "1.5/3/6 Gbd";
+    case 0x0a: return "10.3125 Gbd";
+    case 0x1a: return "25.78125 Gbd";
+    default:   return "?";
+    }
+}
+
+/* LNmGCR0[IF_WIDTH] -> PCS parallel interface width. */
+static const char *if_width(uint32_t gcr0)
+{
+    switch (gcr0 & LN_GCR0_IF_WIDTH_MASK) {
+    case 0: return "10-bit";
+    case 1: return "16-bit";
+    case 2: return "20-bit";
+    case 3: return "32-bit";
+    case 4: return "40-bit";
+    default: return "?";
+    }
+}
+
 /* Print a PLL block (PLLF or PLLS) */
 static void
 print_pll(const volatile uint32_t *map,
+          int blk_idx,
           const char *name,
           uint32_t off_rstctl,
           uint32_t off_cr0,
@@ -197,7 +293,7 @@ print_pll(const volatile uint32_t *map,
     bool dis      = bit(rst, PLL_RSTCTL_DIS);
     bool rst_done = bit(rst, PLL_RSTCTL_RST_DONE);
     bool rst_err  = bit(rst, PLL_RSTCTL_RST_ERR);
-    bool lock     = bit(cr0, PLL_CR0_LOCK);
+    bool lock     = bit(rst, PLL_RSTCTL_LOCK);
 
     bool ok = dis ? true : (rst_done && lock && !rst_err);
 
@@ -205,12 +301,32 @@ print_pll(const volatile uint32_t *map,
            name, checkmark(ok), rst, cr0, cr1);
     printf("        DIS=%s  RST_DONE=%s  RST_ERR=%s  LOCK=%s",
            yn(dis), yn(rst_done), yn(rst_err), yn(lock));
-    if (dis)            printf("  --> powered down (RCW SRDS_PLL_PD_*)");
+    /*
+     * A PLL parked by the RCW but pre-configured with an 8 GHz
+     * clock-net is not dead weight: it is the documented PCIe Gen3
+     * standby configuration; gen1/gen2 train from the 5 GHz PLL
+     * and the PCIe hardware hands the lanes* over to this PLL on
+     * the fly at the Gen3 speed switch (the protocol tables' "PLL
+     * mapping after Gen3 speed switch" column).
+     */
+    uint32_t fr = (cr1 >> PLL_CR1_FRATE_SEL_SHIFT) & PLL_CR1_FRATE_SEL_MASK;
+    bool gen3_standby = dis && (fr == 0x17 || fr == 0x19);
+
+    if (gen3_standby)   printf("  --> parked by RCW: PCIe Gen3 STANDBY (8 GHz clknet preset; hardware wakes it at the Gen3 speed switch)");
+    else if (dis)       printf("  --> powered down (RCW SRDS_PLL_PD_*)");
     else if (rst_err)   printf("  --> *** PLL reset error ***");
     else if (!rst_done) printf("  --> still in reset");
     else if (!lock)     printf("  --> *** PLL not locked ***");
     else                printf("  --> healthy");
     printf("\n");
+    /*
+     * Clock information: the refclk arrives on the external
+     * SDn_PLL{F,S}_REF_CLK_P/N ball pair (there is no on-die refclk
+     * source); who drives that pair is a per board topic.
+     * REFCLK_SEL/FRATE_SEL are what the RCW programmed into the PLL.
+     */
+    printf("        refclk = %s on SD%d_PLL%s_REF_CLK_P/N (external)   clknet = %s\n",
+           refclk_mhz(cr0), blk_idx, name, frate(cr1));
 }
 
 /*  Print one lane  */
@@ -246,9 +362,11 @@ print_lane(const struct block_info *blk,
     bool ok = fully_off ? true : (tx_rst_done && rx_rst_done && cdr_lock);
 
     if (m == MODE_QUIET) {
-        printf("SD%d LN%c  %s  CDR_LOCK=%u  TX_DIS=%u  RX_DIS=%u  TX_RST_DONE=%u  RX_RST_DONE=%u   %s\n",
+        printf("SD%d LN%c  %s  CDR_LOCK=%u  TX_DIS=%u  RX_DIS=%u  TX_RST_DONE=%u  RX_RST_DONE=%u  mode=%s rate=%s   %s\n",
                blk->idx, 'A' + a, checkmark(ok),
                cdr_lock, tx_dis, rx_dis, tx_rst_done, rx_rst_done,
+               fully_off ? "disabled" : lane_mode_short(gcr0),
+               fully_off ? "-" : lane_rate(gcr0),
                blk->lane_labels[a]);
         return ok ? 0 : 1;
     }
@@ -272,6 +390,12 @@ print_lane(const struct block_info *blk,
     /* Default human-readable view */
     printf("  Lane %d (LN%c)  %s  --  %s\n",
            a, 'A' + a, checkmark(ok), blk->lane_labels[a]);
+    if (fully_off)
+        printf("    mode    = disabled (TX+RX DIS)\n");
+    else
+        printf("    mode    = %s   IF_WIDTH=%s   rate=%s%s\n",
+               lane_mode(gcr0), if_width(gcr0), lane_rate(gcr0),
+               bit(gcr0, LN_GCR0_PORT_LN0_B) == 0 ? "   [port master lane]" : "");
     printf("    GCR0    = 0x%08x\n", gcr0);
     printf("    TRSTCTL = 0x%08x   RST_DONE=%u  DIS=%u\n",
            trst, tx_rst_done, tx_dis);
@@ -281,7 +405,7 @@ print_lane(const struct block_info *blk,
     else if (!rx_rst_done)  printf("*** RX still in reset ***\n");
     else if (!cdr_lock)     printf("*** no CDR lock — RX not seeing valid signal ***\n");
     else                    printf("--> RX healthy\n");
-    printf("    TX equ  = TECR0=0x%08x  TECR1=0x%08x   (FIR taps; refer to RM §26.4.1.15)\n",
+    printf("    TX equ  = TECR0=0x%08x  TECR1=0x%08x   (FIR taps)\n",
            tecr0, tecr1);
     printf("    RX equ  = RECR2=0x%08x  RECR3=0x%08x  RECR4=0x%08x\n",
            recr2, recr3, recr4);
@@ -289,6 +413,105 @@ print_lane(const struct block_info *blk,
            rgcr0, rgcr1);
 
     return ok ? 0 : 1;
+}
+
+/*
+ * Multi-lane port grouping
+ *
+ * LNmGCR0[PORT_LN0_B]=0 marks the master clock lane of a port (it is
+ * also 0 on single-lane ports and on disabled lanes), the other lanes
+ * of a multi-lane port carry PORT_LN0_B=1 and the same PROTO_SEL.
+ * Scan lanes A..H: each PORT_LN0_B=0 lane opens a group, and the
+ * following PORT_LN0_B=1 lanes with the same PROTO_SEL join it (the
+ * RCW protocols on this SoC place the master left-most,
+ * PORT_RST_LEFT=1: e.g. PCIe x4 = master LNA + members LNB..LND).
+ *
+ * Per group: lane span, silicon mode, xN width, IF_WIDTH, per-lane
+ * CDR bitmap, and a settings-consistency verdict (all member lanes
+ * must share PROTO_SEL + IF_WIDTH).
+ */
+static void
+print_ports(const struct block_info *blk,
+            const volatile uint32_t *map,
+            enum mode m)
+{
+    uint32_t gcr0[NUM_LANES], trst[NUM_LANES], rrst[NUM_LANES];
+
+    for (int i = 0; i < NUM_LANES; i++) {
+        gcr0[i] = read_reg(map, LANE_OFF(OFF_LANE_GCR0,    i));
+        trst[i] = read_reg(map, LANE_OFF(OFF_LANE_TRSTCTL, i));
+        rrst[i] = read_reg(map, LANE_OFF(OFF_LANE_RRSTCTL, i));
+    }
+
+    if (m == MODE_HUMAN)
+        printf("\nPorts (grouping from LNmGCR0[PORT_LN0_B]):\n");
+
+    int a = 0;
+    while (a < NUM_LANES) {
+        int first = a;
+        int n = 1;
+
+        /*
+         * Direction-aware walk: with PORT_RST_LEFT=1
+         * the master (PORT_LN0_B=0) is the LEFT-most lane and members
+         * follow it (PCIe x4); with PORT_RST_LEFT=0 the master is the
+         * RIGHT-most lane and members precede it (the 100GE CAUI4
+         * groups use this orientation).
+         */
+        bool left = bit(gcr0[first], LN_GCR0_PORT_RST_LEFT) == 1;
+        if (left) {
+            while (first + n < NUM_LANES &&
+                   bit(gcr0[first + n], LN_GCR0_PORT_LN0_B) == 1 &&
+                   (((gcr0[first + n] ^ gcr0[first])
+                     >> LN_GCR0_PROTO_SEL_SHIFT) & LN_GCR0_PROTO_SEL_MASK) == 0)
+                n++;
+        } else {
+            while (bit(gcr0[first + n - 1], LN_GCR0_PORT_LN0_B) == 1 &&
+                   first + n < NUM_LANES &&
+                   (((gcr0[first + n] ^ gcr0[first])
+                     >> LN_GCR0_PROTO_SEL_SHIFT) & LN_GCR0_PROTO_SEL_MASK) == 0)
+                n++;
+        }
+        a = first + n;
+        int master = left ? first : first + n - 1;
+
+        bool disabled = bit(trst[first], LN_TRSTCTL_DIS) &&
+                        bit(rrst[first], LN_RRSTCTL_DIS);
+
+        bool consistent = true;
+        char cdr[NUM_LANES + 1];
+        for (int i = 0; i < n; i++) {
+            if (((gcr0[first + i] ^ gcr0[first]) & 0xffu) != 0)
+                consistent = false;   /* PROTO_SEL or IF_WIDTH differs */
+            cdr[i] = bit(rrst[first + i], LN_RRSTCTL_CDR_LOCK) ? '1' : '0';
+        }
+        cdr[n] = '\0';
+
+        if (m == MODE_QUIET) {
+            if (n > 1)   /* per-lane quiet lines already cover x1 */
+                printf("SD%d PORT LN%c..LN%c x%d mode=%s IF=%s rate=%s/lane CDR=%s%s\n",
+                       blk->idx, 'A' + first, 'A' + first + n - 1, n,
+                       lane_mode_short(gcr0[first]), if_width(gcr0[first]),
+                       lane_rate(gcr0[first]), cdr,
+                       consistent ? "" : " *** SETTINGS MISMATCH ***");
+            continue;
+        }
+
+        if (disabled && n == 1) {
+            printf("  LN%c        x1  disabled\n", 'A' + first);
+        } else if (n == 1) {
+            printf("  LN%c        x1  %-34s IF=%s  rate=%s  CDR=%s\n",
+                   'A' + first, lane_mode(gcr0[first]),
+                   if_width(gcr0[first]), lane_rate(gcr0[first]), cdr);
+        } else {
+            printf("  LN%c..LN%c   x%d  %-34s IF=%s  rate=%s/lane  master=LN%c  CDR=%s  %s\n",
+                   'A' + first, 'A' + first + n - 1, n,
+                   lane_mode(gcr0[first]), if_width(gcr0[first]),
+                   lane_rate(gcr0[first]), 'A' + master, cdr,
+                   consistent ? "settings-consistent"
+                              : "*** SETTINGS MISMATCH across lanes ***");
+        }
+    }
 }
 
 static int
@@ -308,8 +531,11 @@ print_block(const struct block_info *blk,
         printf("  RSTCTL = 0x%08x\n", read_reg(map, OFF_RSTCTL));
 
         printf("\nPLL state:\n");
-        print_pll(map, "F", OFF_PLLFRSTCTL, OFF_PLLFCR0, OFF_PLLFCR1);
-        print_pll(map, "S", OFF_PLLSRSTCTL, OFF_PLLSCR0, OFF_PLLSCR1);
+        print_pll(map, blk->idx, "F", OFF_PLLFRSTCTL, OFF_PLLFCR0, OFF_PLLFCR1);
+        print_pll(map, blk->idx, "S", OFF_PLLSRSTCTL, OFF_PLLSCR0, OFF_PLLSCR1);
+
+        if (m == MODE_HUMAN && filter_lane < 0)
+            print_ports(blk, map, m);
 
         printf("\nPer-lane state:\n");
     }
@@ -322,6 +548,9 @@ print_block(const struct block_info *blk,
             printf("\n");
     }
 
+    if (m == MODE_QUIET && filter_lane < 0)
+        print_ports(blk, map, m);
+
     return failures;
 }
 
@@ -331,8 +560,6 @@ mmap_block(int fd, uint64_t base)
 {
     void *p = mmap(NULL, SD_BLOCK_MAP_LEN, PROT_READ, MAP_SHARED, fd, (off_t)base);
     if (p == MAP_FAILED) {
-        /* warn() — emits "<progname>: <fmt>: <strerror(errno)>" to stderr
-         * and returns; lets the caller continue with the next block. */
         warn("mmap(0x%" PRIx64 ", %lu)", base, SD_BLOCK_MAP_LEN);
         return NULL;
     }
@@ -359,10 +586,7 @@ usage(const char *argv0)
         "                    (RX state machine not done, or CDR_LOCK=0),\n"
         "                    or a runtime error (e.g. /dev/mem inaccessible)\n"
         "  2  EXIT_USAGE   — argument error (bad block/lane index)\n"
-        "\n"
-        "References:\n"
-        "  doc/LX2160ARM.txt §26.4 SerDes register descriptions\n"
-        "  doc/lx2160a-serdes-list.md §\"LX2160A-side per-lane health registers\"\n",
+        "\n",
         argv0);
 }
 
