@@ -72,9 +72,10 @@
 #define OFF_LANE_RRSTCTL    0x840   /* RX Reset Control (CDR_LOCK at bit 12) */
 #define OFF_LANE_RGCR0      0x844   /* RX General Control 0 */
 #define OFF_LANE_RGCR1      0x848   /* RX General Control 1 */
-#define OFF_LANE_RECR2      0x84C   /* RX Equalization 2 */
-#define OFF_LANE_RECR3      0x850   /* RX Equalization 3 */
-#define OFF_LANE_RECR4      0x854   /* RX Equalization 4 */
+
+#define OFF_LANE_RECR2      0x858   /* RX Equalization 2 */
+#define OFF_LANE_RECR3      0x85C   /* RX Equalization 3 */
+#define OFF_LANE_RECR4      0x860   /* RX Equalization 4 */
 
 #define LANE_STRIDE         0x100
 #define NUM_LANES           8
