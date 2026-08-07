@@ -43,3 +43,9 @@ executable('lx2160-sata',
   link_args : link_args,
   install : true,
 )
+
+executable('lx2160-linkmon',
+  'src/lx2160-linkmon.c',
+  link_args : link_args,
+  install : true,
+)
