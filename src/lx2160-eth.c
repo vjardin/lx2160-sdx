@@ -1070,7 +1070,7 @@ static int fec_counters(volatile uint32_t *mac, int mac_id, enum mode m)
                mac_id, st, bit(st, RSFEC_STATUS_ALIGN),
                bit(st, RSFEC_STATUS_ALIGN)
                    ? "locked, deskew complete"
-                   : "not aligned -- normal where RS-FEC is not in use");
+                   : "not aligned -- no link, or RS-FEC not in use here");
         printf("         corrected codewords   = %-10u  (CCW)\n", ccw);
         printf("         uncorrected codewords = %-10u  (NCCW)\n", nccw);
         printf("         counters cleared by this read -- next read is the delta\n");
