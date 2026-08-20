@@ -10,6 +10,7 @@
  *   ./lx2160-eth                 # all Ethernet lanes of SD1..SD3
  *   ./lx2160-eth --block 2       # only SD2's Ethernet lanes
  *   ./lx2160-eth --quiet         # one line per lane
+ *   ./lx2160-eth --quiet --stages # + the per-port link-stage ladder
  */
 
 #define _DEFAULT_SOURCE
@@ -33,7 +34,7 @@
 #define DCFG_MAP_LEN       0x1000UL
 #define OFF_RCWSR29        0x170
 
-#define SD_MAP_LEN         0x1000UL
+#define SD_MAP_LEN         0x2000UL
 static const uint64_t sd_base[4] = { 0, 0x01EA0000UL, 0x01EB0000UL, 0x01EC0000UL };
 
 #define OFF_PLLFRSTCTL     0x400
@@ -82,6 +83,45 @@ static const uint64_t sd_base[4] = { 0, 0x01EA0000UL, 0x01EB0000UL, 0x01EC0000UL
 #define PROTO_SATA   0x02
 #define PROTO_10G    0x0a   /* XFI/SFI/10GBase-R, 10GBase-KR, 10G-SXGMII, 40G */
 #define PROTO_25G    0x1a   /* 25GBase-R/KR, 50G, 100G (CAUI4) lanes */
+
+/* Ethernet protocol status registers */
+#define OFF_SXGMIICR3(l)    (0x1A80 + (l) * 0x10 + 0xC)
+#define OFF_E25GCR3(l)      (0x1B00 + (l) * 0x10 + 0xC)
+#define OFF_E40GCR3(p)      ((p) ? 0x1C4C : 0x1C0C)
+#define OFF_E50GCR3(p)      ((p) ? 0x1DCC : 0x1DAC)
+#define OFF_E100GCR3(p)     ((p) ? 0x1E2C : 0x1E0C)
+
+/* SXGMIIaCR3 -- 10G single lane (RM SS26.4.1.61) */
+#define SXGMII_CR3_BLOCK_LK     7
+#define SXGMII_CR3_FEC_LK       6
+#define SXGMII_CR3_HI_BER       4
+
+/* E25GaCR3 -- 25G single lane (RM SS26.4.1.64) */
+#define E25G_CR3_FEC_LK         16
+#define E25G_CR3_RSFEC_ALN      12
+#define E25G_CR3_AMPS_LK        8
+#define E25G_CR3_HI_BER         4
+#define E25G_CR3_LINK_ST        0
+
+/* E40GaCR3 -- 4 x 10G (RM SS26.4.1.67); the RM table lists no LINK_ST */
+#define E40G_CR3_ALIGN_DN       8
+#define E40G_CR3_HI_BER         4
+
+/* E50GaCR3 -- 2 x 25G (RM SS26.4.1.69) */
+#define E50G_CR3_HI_BER         4
+#define E50G_CR3_ALIGN_DN       1
+#define E50G_CR3_LINK_ST        0
+
+#define OFF_E100GCR2(p)             ((p) ? 0x1E28 : 0x1E08)
+#define E100G_CR2_FEC91_ENA         0x00F00000u
+#define E100G_CR2_BLOCK_LK_MASK     0x000FFFFFu
+
+#define E100G_CR3_RSFEC_ALN_SHIFT   12
+#define E100G_CR3_AMPS_LK_SHIFT     8
+#define E100G_CR3_LANE_MASK         0xFu
+#define E100G_CR3_HI_BER            4
+#define E100G_CR3_ALIGN_LK          1
+#define E100G_CR3_LINK_ST           0
 
 /*
  * Ethernet lane expectations per known (SerDes block, SRDS_PRTCL)
@@ -356,9 +396,205 @@ print_eth_lane(int sd_idx, const volatile uint32_t *sd, int lane,
     return ok ? 0 : 1;
 }
 
+/*
+ * Link bring-up ladder for one Ethernet port.
+ */
+
+#define MAX_STAGES 8
+
+struct link_stage {
+    const char *name;
+    const char *note;      /* RM field name, for cross-reference */
+    uint32_t    val;       /* per-lane bitmap, or 0/1 for a single bit */
+    int         lanes;     /* >1 => render val as a per-lane bitmap */
+    bool        ok;
+
+    bool        info;
+    const char *text;      /* optional rendering override for info rows */
+};
+
+static void
+add_stage(struct link_stage *st, int *ns, const char *name, const char *note,
+          uint32_t val, int lanes, bool ok)
+{
+    st[*ns] = (struct link_stage){ .name = name, .note = note, .val = val,
+                                   .lanes = lanes, .ok = ok };
+    (*ns)++;
+}
+
+/* Printed, but never eligible as "the stage we stalled at". */
+static void
+add_info(struct link_stage *st, int *ns, const char *name, const char *note,
+         uint32_t val, int lanes, bool ok, const char *text)
+{
+    st[*ns] = (struct link_stage){ .name = name, .note = note, .val = val,
+                                   .lanes = lanes, .ok = ok, .info = true,
+                                   .text = text };
+    (*ns)++;
+}
+
+/* Render a per-lane field lane-0-first: field 0b0011 over 4 lanes -> "1100". */
+static void
+lane_bits(uint32_t v, int n, char *out)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        out[i] = ((v >> i) & 1u) ? '1' : '0';
+    out[i] = '\0';
+}
+
+static void
+print_link_stages(int sd_idx, const volatile uint32_t *sd,
+                  int first, int n, uint32_t gcr0, const char *cdr,
+                  enum mode m)
+{
+    uint32_t ps  = proto_sel(gcr0);
+    int      grp = (first >= 4);           /* "a" = LNA..LND, "b" = LNE..LNH */
+    struct link_stage st[MAX_STAGES];
+    int      ns = 0;
+    uint32_t reg, off;
+    const char *regname;
+    bool cdr_all = true;
+
+    for (int i = 0; i < n; i++)
+        if (cdr[i] != '1')
+            cdr_all = false;
+
+    if      (ps == PROTO_25G && n == 4) { off = OFF_E100GCR3(grp);   regname = grp ? "E100GbCR3" : "E100GaCR3"; }
+    else if (ps == PROTO_25G && n == 2) { off = OFF_E50GCR3(grp);    regname = grp ? "E50GbCR3"  : "E50GaCR3";  }
+    else if (ps == PROTO_25G && n == 1) { off = OFF_E25GCR3(first);  regname = "E25GaCR3";  }
+    else if (ps == PROTO_10G && n == 4) { off = OFF_E40GCR3(grp);    regname = grp ? "E40GbCR3"  : "E40GaCR3";  }
+    else if (ps == PROTO_10G && n == 1) { off = OFF_SXGMIICR3(first);regname = "SXGMIIaCR3"; }
+    else return;   /* 1G/PCIe/SATA have their own status paths */
+
+    reg = rd32(sd, off);
+
+    add_stage(st, &ns, "CDR lock",
+                  "LNaRRSTCTL[12]",
+                  0, n, cdr_all);
+
+    if (ps == PROTO_25G && n == 4) {
+        uint32_t amps = (reg >> E100G_CR3_AMPS_LK_SHIFT)   & E100G_CR3_LANE_MASK;
+        uint32_t aln  = (reg >> E100G_CR3_RSFEC_ALN_SHIFT) & E100G_CR3_LANE_MASK;
+        uint32_t all  = (1u << n) - 1u;
+        uint32_t cr2  = rd32(sd, OFF_E100GCR2(grp));
+        uint32_t fec  = (cr2 & E100G_CR2_FEC91_ENA) == E100G_CR2_FEC91_ENA;
+        uint32_t vlbl = cr2 & E100G_CR2_BLOCK_LK_MASK;
+        static char vlbuf[16], fecnote[40], blknote[48];
+
+        snprintf(fecnote, sizeof fecnote, "E100G%cCR2 FEC91_ENA", grp ? 'b' : 'a');
+        snprintf(blknote, sizeof blknote,
+                 "E100G%cCR2[19:0], n/a under RS-FEC", grp ? 'b' : 'a');
+        add_info(st, &ns, "RS-FEC enabled", fecnote,
+                 fec, 1, true, fec ? "yes" : "no");
+        add_stage(st, &ns, "RS-FEC codeword align",
+                  "AMPS_LK (pre-deskew)",
+                  amps, n, amps == all);
+        add_stage(st, &ns, "RS-FEC deskew+reorder",
+                  "RSFEC_ALN",
+                  aln, n, aln == all);
+        /* 20 virtual lanes; the RM marks this not relevant in RS-FEC mode. */
+        snprintf(vlbuf, sizeof vlbuf, "%d/20", __builtin_popcount(vlbl));
+        add_info(st, &ns, "64b/66b block lock", blknote,
+                 vlbl, 1, vlbl == E100G_CR2_BLOCK_LK_MASK, vlbuf);
+        add_stage(st, &ns, "AM lock (all VLs)",
+                  "ALIGN_LK",
+                  bit(reg, E100G_CR3_ALIGN_LK), 1, bit(reg, E100G_CR3_ALIGN_LK));
+        add_stage(st, &ns, "no high BER",
+                  "HI_BER",
+                  bit(reg, E100G_CR3_HI_BER), 1, !bit(reg, E100G_CR3_HI_BER));
+        add_stage(st, &ns, "LINK_ST (MC polls this)",
+                  "ALIGN_LK && !HI_BER",
+                  bit(reg, E100G_CR3_LINK_ST), 1, bit(reg, E100G_CR3_LINK_ST));
+    } else if (ps == PROTO_25G && n == 2) {
+        add_stage(st, &ns, "AM lock (all VLs)",
+                  "ALIGN_DN",
+                  bit(reg, E50G_CR3_ALIGN_DN), 1, bit(reg, E50G_CR3_ALIGN_DN));
+        add_stage(st, &ns, "no high BER",
+                  "HI_BER",
+                  bit(reg, E50G_CR3_HI_BER), 1, !bit(reg, E50G_CR3_HI_BER));
+        add_stage(st, &ns, "LINK_ST (MC polls this)",
+                  "ALIGN_DN && !HI_BER",
+                  bit(reg, E50G_CR3_LINK_ST), 1, bit(reg, E50G_CR3_LINK_ST));
+    } else if (ps == PROTO_25G && n == 1) {
+        /* RM note on FEC_LK: FEC must lock before the PCS can synchronise,
+         * and that lock can take milliseconds -- do not read once and judge. */
+        add_stage(st, &ns, "RS-FEC lock",
+                  "FEC_LK (takes ms)",
+                  bit(reg, E25G_CR3_FEC_LK), 1, bit(reg, E25G_CR3_FEC_LK));
+        add_stage(st, &ns, "RS-FEC codeword align",
+                  "AMPS_LK",
+                  bit(reg, E25G_CR3_AMPS_LK), 1, bit(reg, E25G_CR3_AMPS_LK));
+        add_stage(st, &ns, "RS-FEC alignment",
+                  "RSFEC_ALN",
+                  bit(reg, E25G_CR3_RSFEC_ALN), 1, bit(reg, E25G_CR3_RSFEC_ALN));
+        add_stage(st, &ns, "no high BER",
+                  "HI_BER",
+                  bit(reg, E25G_CR3_HI_BER), 1, !bit(reg, E25G_CR3_HI_BER));
+        add_stage(st, &ns, "LINK_ST (MC polls this)",
+                  "",
+                  bit(reg, E25G_CR3_LINK_ST), 1, bit(reg, E25G_CR3_LINK_ST));
+    } else if (ps == PROTO_10G && n == 4) {
+        add_stage(st, &ns, "AM lock (all VLs)",
+                  "ALIGN_DN",
+                  bit(reg, E40G_CR3_ALIGN_DN), 1, bit(reg, E40G_CR3_ALIGN_DN));
+        add_stage(st, &ns, "no high BER",
+                  "HI_BER",
+                  bit(reg, E40G_CR3_HI_BER), 1, !bit(reg, E40G_CR3_HI_BER));
+    } else {   /* SXGMII / XFI, single lane */
+        /* SXGMIIaCR2 exposes no FEC-enable bit, so a clear FEC_LK cannot be
+         * distinguished from "this link does not use FEC". Informational:
+         * BLOCK_LK is the gating stage here. */
+        add_info(st, &ns, "FEC lock",
+                 "FEC_LK (only if FEC in use)",
+                 bit(reg, SXGMII_CR3_FEC_LK), 1, bit(reg, SXGMII_CR3_FEC_LK), NULL);
+        add_stage(st, &ns, "64b/66b block lock",
+                  "BLOCK_LK",
+                  bit(reg, SXGMII_CR3_BLOCK_LK), 1, bit(reg, SXGMII_CR3_BLOCK_LK));
+        add_stage(st, &ns, "no high BER",
+                  "HI_BER",
+                  bit(reg, SXGMII_CR3_HI_BER), 1, !bit(reg, SXGMII_CR3_HI_BER));
+    }
+
+    const char *stalled = NULL;
+    for (int i = 0; i < ns; i++)
+        if (!st[i].info && !st[i].ok) { stalled = st[i].name; break; }
+
+    char buf[24];
+
+    if (m == MODE_QUIET) {
+        printf("SD%d STAGES LN%c..LN%c %s=0x%08x", sd_idx,
+               'A' + first, 'A' + first + n - 1, regname, reg);
+        for (int i = 0; i < ns; i++) {
+            if (i == 0)                 snprintf(buf, sizeof buf, "%s", cdr);
+            else if (st[i].text)        snprintf(buf, sizeof buf, "%s", st[i].text);
+            else if (st[i].lanes > 1)   lane_bits(st[i].val, st[i].lanes, buf);
+            else                        snprintf(buf, sizeof buf, "%u", st[i].val);
+            printf(" %s=%s", st[i].note[0] ? st[i].note : st[i].name, buf);
+        }
+        printf(" -> %s\n", stalled ? stalled : "LINK UP");
+        return;
+    }
+
+    printf("       link stages (%s = 0x%08x):\n", regname, reg);
+    for (int i = 0; i < ns; i++) {
+        if (i == 0)                 snprintf(buf, sizeof buf, "%s", cdr);
+        else if (st[i].text)        snprintf(buf, sizeof buf, "%s", st[i].text);
+        else if (st[i].lanes > 1)   lane_bits(st[i].val, st[i].lanes, buf);
+        else                        snprintf(buf, sizeof buf, "%u", st[i].val);
+        printf("         %-24s %-6s %s%s%s\n",
+               st[i].name, buf,
+               st[i].info ? "(i) " : (st[i].ok ? "[OK]" : "[!!]"),
+               st[i].note[0] ? "   " : "", st[i].note);
+    }
+    printf("         => %s\n",
+           stalled ? stalled : "link up");
+}
+
 /* Multi-lane grouping header, same PORT_LN0_B walk as lx2160-sdx. */
 static void
-print_groups(int sd_idx, const volatile uint32_t *sd, enum mode m)
+print_groups(int sd_idx, const volatile uint32_t *sd, enum mode m,
+             bool want_stages)
 {
     uint32_t gcr0[NUM_LANES], rrst[NUM_LANES];
 
@@ -390,7 +626,7 @@ print_groups(int sd_idx, const volatile uint32_t *sd, enum mode m)
         a = first + n;
         int master = left ? first : first + n - 1;
 
-        if (n < 2 || !is_eth(proto_sel(gcr0[first])))
+        if (!is_eth(proto_sel(gcr0[first])))
             continue;
 
         bool consistent = true;
@@ -402,19 +638,27 @@ print_groups(int sd_idx, const volatile uint32_t *sd, enum mode m)
         }
         cdr[n] = '\0';
 
-        if (m == MODE_QUIET)
-            printf("SD%d GROUP LN%c..LN%c x%d %s %s/lane CDR=%s%s\n",
-                   sd_idx, 'A' + first, 'A' + first + n - 1, n,
-                   mode_short(proto_sel(gcr0[first])),
-                   rate_str(proto_sel(gcr0[first])), cdr,
-                   consistent ? "" : " *** SETTINGS MISMATCH ***");
-        else
-            printf("  group LN%c..LN%c  x%d  %s  %s/lane  master=LN%c  CDR=%s  %s\n",
-                   'A' + first, 'A' + first + n - 1, n,
-                   mode_str(proto_sel(gcr0[first])),
-                   rate_str(proto_sel(gcr0[first])), 'A' + master, cdr,
-                   consistent ? "settings-consistent"
-                              : "*** SETTINGS MISMATCH across lanes ***");
+        /* The group header stays multi-lane only; single-lane ports are
+         * already covered by the per-lane report above it. The stage
+         * ladder applies to both, so it is emitted for every port. */
+        if (n >= 2) {
+            if (m == MODE_QUIET)
+                printf("SD%d GROUP LN%c..LN%c x%d %s %s/lane CDR=%s%s\n",
+                       sd_idx, 'A' + first, 'A' + first + n - 1, n,
+                       mode_short(proto_sel(gcr0[first])),
+                       rate_str(proto_sel(gcr0[first])), cdr,
+                       consistent ? "" : " *** SETTINGS MISMATCH ***");
+            else
+                printf("  group LN%c..LN%c  x%d  %s  %s/lane  master=LN%c  CDR=%s  %s\n",
+                       'A' + first, 'A' + first + n - 1, n,
+                       mode_str(proto_sel(gcr0[first])),
+                       rate_str(proto_sel(gcr0[first])), 'A' + master, cdr,
+                       consistent ? "settings-consistent"
+                                  : "*** SETTINGS MISMATCH across lanes ***");
+        }
+
+        if (m == MODE_HUMAN || want_stages)
+            print_link_stages(sd_idx, sd, first, n, gcr0[first], cdr, m);
     }
 }
 
@@ -710,6 +954,8 @@ usage(const char *argv0)
         "Options:\n"
         "  -b, --block N    Only report SerDes block N (1..3)\n"
         "  -q, --quiet      One line per Ethernet lane (parse-friendly)\n"
+        "      --stages     Also emit the per-port link-stage ladder in --quiet\n"
+        "                   (always shown in the default human report)\n"
         "  -h, --help       Show this help and exit\n"
         "\n"
         "Lynx-28G RX diagnostics (default block 1):\n"
@@ -731,17 +977,18 @@ main(int argc, char **argv)
 {
     int filter_block = -1;
     enum mode m = MODE_HUMAN;
-    bool do_eqbins = false, do_js = false;
+    bool do_eqbins = false, do_js = false, want_stages = false;
     int diag_lane = -1;
     uint32_t js_mode = TST_PIJITTER;
     unsigned js_step = 8, js_dwell = 2000;
 
     enum { OPT_EQBINS = 1000, OPT_JS, OPT_LANE, OPT_JSMODE, OPT_JSSTEP,
-           OPT_JSDWELL };
+           OPT_JSDWELL, OPT_STAGES };
     static const struct option longopts[] = {
         { "block",        required_argument, NULL, 'b' },
         { "quiet",        no_argument,       NULL, 'q' },
         { "help",         no_argument,       NULL, 'h' },
+        { "stages",       no_argument,       NULL, OPT_STAGES },
         { "eq-bins",      no_argument,       NULL, OPT_EQBINS },
         { "jitter-scope", no_argument,       NULL, OPT_JS },
         { "lane",         required_argument, NULL, OPT_LANE },
@@ -760,6 +1007,7 @@ main(int argc, char **argv)
                 errx(EXIT_USAGE, "block must be 1..3 (got '%s')", optarg);
             break;
         case 'q': m = MODE_QUIET; break;
+        case OPT_STAGES: want_stages = true; break;
         case OPT_EQBINS: do_eqbins = true; break;
         case OPT_JS: do_js = true; break;
         case OPT_LANE:
@@ -873,7 +1121,7 @@ main(int argc, char **argv)
                    refclk_mhz(pf.cr0), frate(pf.cr1),
                    ps_.dis ? "off" : (ps_.lock ? "LOCKED" : "NOT-locked"),
                    refclk_mhz(ps_.cr0), frate(ps_.cr1));
-            print_groups(s, sd, m);
+            print_groups(s, sd, m, want_stages);
         }
 
         if (em) {
@@ -896,7 +1144,7 @@ main(int argc, char **argv)
         }
 
         if (m == MODE_QUIET)
-            print_groups(s, sd, m);
+            print_groups(s, sd, m, want_stages);
     }
 
     return failures ? EXIT_FAILURE : EXIT_SUCCESS;
