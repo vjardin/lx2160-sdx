@@ -74,6 +74,7 @@ static const uint64_t sd_base[4] = { 0, 0x01EA0000UL, 0x01EB0000UL, 0x01EC0000UL
 #define LN_RST_DONE         30
 #define LN_DIS              24
 #define LN_RRSTCTL_CDR_LOCK 12
+#define LN_RST_REQ          31
 #define LN_GCR0_PORT_LN0_B  16
 #define LN_GCR0_PORT_RST_LEFT 17
 
@@ -485,6 +486,71 @@ proto_instance(int sd_idx, int first, int n)
     return first / n;
 }
 
+/* Which protocol status register serves this port, and which layout it uses. */
+enum ps_kind { PSK_NONE, PSK_E100G, PSK_E50G, PSK_E25G, PSK_E40G, PSK_SXGMII };
+
+static enum ps_kind
+port_status_reg(int sd_idx, uint32_t ps, int first, int n,
+                uint32_t *off, char *name, size_t namesz)
+{
+    int inst = proto_instance(sd_idx, first, n);
+
+    if      (ps == PROTO_25G && n == 4) { if (inst > 1) return PSK_NONE;
+        *off = OFF_E100GCR3(inst); snprintf(name, namesz, "E100G%cCR3", 'a'+inst); return PSK_E100G; }
+    else if (ps == PROTO_25G && n == 2) { if (inst > 1) return PSK_NONE;
+        *off = OFF_E50GCR3(inst);  snprintf(name, namesz, "E50G%cCR3",  'a'+inst); return PSK_E50G; }
+    else if (ps == PROTO_25G && n == 1) {
+        *off = OFF_E25GCR3(inst);  snprintf(name, namesz, "E25G%cCR3",  'a'+inst); return PSK_E25G; }
+    else if (ps == PROTO_10G && n == 4) { if (inst > 1) return PSK_NONE;
+        *off = OFF_E40GCR3(inst);  snprintf(name, namesz, "E40G%cCR3",  'a'+inst); return PSK_E40G; }
+    else if (ps == PROTO_10G && n == 1) {
+        *off = OFF_SXGMIICR3(inst);snprintf(name, namesz, "SXGMII%cCR3",'a'+inst); return PSK_SXGMII; }
+    return PSK_NONE;
+}
+
+/*
+ * Does this port show the "stuck PCS" signature that a lane reset clears?
+ *
+ *   every lane CDR-locked + LINK_ST == 0 + HI_BER == 0
+ *
+ * i.e. signal is arriving and clocked, the port is down, and it is not a
+ * noise problem. That is what MC leaves behind when its link state machine
+ * latches on a grouped port: `ip link down/up` does not clear it
+ *
+ * Caution: this signature is also what a link partner that is not emitting
+ * valid framing looks like. The two are indistinguishable from here, which
+ * is why the kick is the cheap thing to try FIRST
+ *
+ * A lane with CDR=0 is excluded: there is no signal to re-lock onto.
+ * HI_BER=1 is excluded: that is signal integrity, and a reset only hides it.
+ */
+static bool
+port_is_stuck(int sd_idx, const volatile uint32_t *sd, int first, int n,
+              uint32_t gcr0, const char *cdr, const char **why)
+{
+    uint32_t off = 0, reg;
+    char nm[16];
+    enum ps_kind k = port_status_reg(sd_idx, proto_sel(gcr0), first, n,
+                                     &off, nm, sizeof nm);
+    int link_bit, hiber_bit;
+
+    for (int i = 0; i < n; i++)
+        if (cdr[i] != '1') { *why = "not every lane has CDR lock -- no signal to re-lock"; return false; }
+
+    switch (k) {
+    case PSK_E100G: link_bit = E100G_CR3_LINK_ST; hiber_bit = E100G_CR3_HI_BER; break;
+    case PSK_E50G:  link_bit = E50G_CR3_LINK_ST;  hiber_bit = E50G_CR3_HI_BER;  break;
+    case PSK_E25G:  link_bit = E25G_CR3_LINK_ST;  hiber_bit = E25G_CR3_HI_BER;  break;
+    default:        *why = "no LINK_ST for this port type"; return false;
+    }
+
+    reg = rd32(sd, off);
+    if (bit(reg, link_bit))  { *why = "already up (LINK_ST=1)"; return false; }
+    if (bit(reg, hiber_bit)) { *why = "HI_BER set -- signal integrity, not a latch"; return false; }
+    *why = "CDR locked on all lanes, LINK_ST=0, HI_BER=0";
+    return true;
+}
+
 static void
 print_link_stages(int sd_idx, const volatile uint32_t *sd,
                   int first, int n, uint32_t gcr0, const char *cdr,
@@ -504,15 +570,8 @@ print_link_stages(int sd_idx, const volatile uint32_t *sd,
 
     static char rn[16];
 
-    /* E100G/E40G have only two instances (a,b) and E50G two as well, so an
-     * out-of-range instance means the port shape is one this decode does
-     * not cover: say nothing rather than read an unrelated register. */
-    if      (ps == PROTO_25G && n == 4) { if (inst > 1) return; off = OFF_E100GCR3(inst); snprintf(rn, sizeof rn, "E100G%cCR3", 'a' + inst); }
-    else if (ps == PROTO_25G && n == 2) { if (inst > 1) return; off = OFF_E50GCR3(inst);  snprintf(rn, sizeof rn, "E50G%cCR3",  'a' + inst); }
-    else if (ps == PROTO_25G && n == 1) { off = OFF_E25GCR3(inst);   snprintf(rn, sizeof rn, "E25G%cCR3", 'a' + inst); }
-    else if (ps == PROTO_10G && n == 4) { if (inst > 1) return; off = OFF_E40GCR3(inst);  snprintf(rn, sizeof rn, "E40G%cCR3",  'a' + inst); }
-    else if (ps == PROTO_10G && n == 1) { off = OFF_SXGMIICR3(inst); snprintf(rn, sizeof rn, "SXGMII%cCR3", 'a' + inst); }
-    else return;   /* 1G/PCIe/SATA have their own status paths */
+    if (port_status_reg(sd_idx, ps, first, n, &off, rn, sizeof rn) == PSK_NONE)
+        return;                /* 1G/PCIe/SATA have their own status paths */
     regname = rn;
 
     reg = rd32(sd, off);
@@ -640,6 +699,94 @@ print_link_stages(int sd_idx, const volatile uint32_t *sd,
     }
     printf("         => %s\n",
            stalled ? stalled : "link up");
+}
+
+/*
+ * Un-halted RX reset on one port's lanes: LNaRRSTCTL[31] RST_REQ, no
+ * preceding HLT_REQ.
+ *
+ * It bounces the link. Gated on port_is_stuck() unless --force.
+ */
+static void
+rx_kick_port(volatile uint32_t *sd, int first, int n)
+{
+    for (int i = 0; i < n; i++) {
+        uint32_t off = OFF_LANE_RRSTCTL + (uint32_t)(first + i) * LANE_STRIDE;
+        wr32(sd, off, rd32(sd, off) | (1u << LN_RST_REQ));
+    }
+}
+
+/*
+ * --rx-kick: find ports showing the stuck-PCS signature and reset their
+ * lanes. Reports what it did and, after settling, whether it worked.
+ */
+static int
+rx_kick_block(int sd_idx, volatile uint32_t *sd, bool force)
+{
+    uint32_t gcr0[NUM_LANES], rrst[NUM_LANES];
+    int kicked = 0, recovered = 0, a = 0;
+    struct { int first, n; } hit[NUM_LANES];
+
+    for (int i = 0; i < NUM_LANES; i++) {
+        gcr0[i] = lane_reg(sd, OFF_LANE_GCR0,    i);
+        rrst[i] = lane_reg(sd, OFF_LANE_RRSTCTL, i);
+    }
+
+    while (a < NUM_LANES) {
+        int first = a, n = 1;
+        bool left = bit(gcr0[first], LN_GCR0_PORT_RST_LEFT) == 1;
+        char cdr[NUM_LANES + 1];
+        const char *why = "";
+
+        if (left) {
+            while (first + n < NUM_LANES && bit(gcr0[first+n], LN_GCR0_PORT_LN0_B) == 1 &&
+                   proto_sel(gcr0[first+n]) == proto_sel(gcr0[first])) n++;
+        } else {
+            while (bit(gcr0[first+n-1], LN_GCR0_PORT_LN0_B) == 1 && first + n < NUM_LANES &&
+                   proto_sel(gcr0[first+n]) == proto_sel(gcr0[first])) n++;
+        }
+        a = first + n;
+        if (!is_eth(proto_sel(gcr0[first])))
+            continue;
+
+        for (int i = 0; i < n; i++)
+            cdr[i] = bit(rrst[first+i], LN_RRSTCTL_CDR_LOCK) ? '1' : '0';
+        cdr[n] = '\0';
+
+        bool stuck = port_is_stuck(sd_idx, sd, first, n, gcr0[first], cdr, &why);
+        printf("  SD%d LN%c..LN%c  CDR=%-8s %s\n", sd_idx, 'A'+first,
+               'A'+first+n-1, cdr, stuck ? "STUCK -- kicking" :
+               (force ? "not stuck, but --force" : why));
+        if (!stuck && !force)
+            continue;
+        rx_kick_port(sd, first, n);
+        hit[kicked].first = first; hit[kicked].n = n; kicked++;
+    }
+
+    if (!kicked) {
+        printf("  nothing to do\n");
+        return 0;
+    }
+    /* MC polls FIXED links at 1 Hz and can take well over 10 s to
+     * re-assert; do not judge the result too early. */
+    printf("  waiting 20 s for MC to re-assert link...\n");
+    fflush(stdout);
+    sleep(20);
+    for (int i = 0; i < kicked; i++) {
+        uint32_t off = 0, g = lane_reg(sd, OFF_LANE_GCR0, hit[i].first);
+        char nm[16];
+        enum ps_kind k = port_status_reg(sd_idx, proto_sel(g), hit[i].first,
+                                         hit[i].n, &off, nm, sizeof nm);
+        int lb = (k == PSK_E100G) ? E100G_CR3_LINK_ST :
+                 (k == PSK_E50G)  ? E50G_CR3_LINK_ST  : E25G_CR3_LINK_ST;
+        bool up = (k != PSK_NONE) && bit(rd32(sd, off), lb);
+        printf("  SD%d LN%c..LN%c  %s = 0x%08x  -> %s\n", sd_idx,
+               'A'+hit[i].first, 'A'+hit[i].first+hit[i].n-1, nm,
+               k == PSK_NONE ? 0 : rd32(sd, off),
+               up ? "LINK UP" : "still down -- not a latch; look at the link partner");
+        if (up) recovered++;
+    }
+    return kicked - recovered;      /* non-zero => something did not recover */
 }
 
 /* Multi-lane grouping header, same PORT_LN0_B walk as lx2160-sdx. */
@@ -1103,6 +1250,10 @@ usage(const char *argv0)
         "  -b, --block N    Only report SerDes block N (1..3)\n"
         "  -q, --quiet      One line per Ethernet lane (parse-friendly)\n"
         "      --stages     Also emit the per-port link-stage ladder in --quiet\n"
+        "      --rx-kick    Reset the lanes of any port showing the stuck-PCS\n"
+        "                   signature (every lane CDR-locked, LINK_ST=0,\n"
+        "                   HI_BER=0), then report whether it recovered.\n"
+        "                   BOUNCES THE LINK. --force skips the gate\n"
         "      --fec        RS-FEC corrected/uncorrected codeword counters for\n"
         "                   every MAC of the selected block(s), MACs derived\n"
         "                   from the protocol table. Counters clear on read\n"
@@ -1132,6 +1283,7 @@ main(int argc, char **argv)
     int filter_block = -1;
     enum mode m = MODE_HUMAN;
     bool do_eqbins = false, do_js = false, want_stages = false;
+    bool do_kick = false, kick_force = false;
     int  fec_mac = -1;
     bool do_fec  = false;
     int diag_lane = -1;
@@ -1139,12 +1291,14 @@ main(int argc, char **argv)
     unsigned js_step = 8, js_dwell = 2000;
 
     enum { OPT_EQBINS = 1000, OPT_JS, OPT_LANE, OPT_JSMODE, OPT_JSSTEP,
-           OPT_JSDWELL, OPT_STAGES, OPT_FECMAC, OPT_FEC };
+           OPT_JSDWELL, OPT_STAGES, OPT_FECMAC, OPT_FEC, OPT_KICK, OPT_FORCE };
     static const struct option longopts[] = {
         { "block",        required_argument, NULL, 'b' },
         { "quiet",        no_argument,       NULL, 'q' },
         { "help",         no_argument,       NULL, 'h' },
         { "stages",       no_argument,       NULL, OPT_STAGES },
+        { "rx-kick",      no_argument,       NULL, OPT_KICK },
+        { "force",        no_argument,       NULL, OPT_FORCE },
         { "fec",          no_argument,       NULL, OPT_FEC },
         { "fec-mac",      required_argument, NULL, OPT_FECMAC },
         { "eq-bins",      no_argument,       NULL, OPT_EQBINS },
@@ -1166,6 +1320,8 @@ main(int argc, char **argv)
             break;
         case 'q': m = MODE_QUIET; break;
         case OPT_STAGES: want_stages = true; break;
+        case OPT_KICK:  do_kick = true; break;
+        case OPT_FORCE: kick_force = true; break;
         case OPT_FEC: do_fec = true; break;
         case OPT_FECMAC:
             fec_mac = atoi(optarg);
@@ -1200,13 +1356,28 @@ main(int argc, char **argv)
         }
     }
 
-    bool diag = do_eqbins || do_js || fec_mac > 0 || do_fec;
+    bool diag = do_eqbins || do_js || fec_mac > 0 || do_fec || do_kick;
     if (do_js && diag_lane < 0)
         errx(EXIT_USAGE, "--jitter-scope needs --lane");
 
     int fd = open("/dev/mem", (diag ? O_RDWR : O_RDONLY) | O_SYNC);
     if (fd < 0)
         err(EXIT_FAILURE, "open /dev/mem (need root)");
+
+    if (do_kick) {
+        int rc = 0;
+        printf("RX lane reset (LNaRRSTCTL[31] RST_REQ, un-halted). This bounces the link.\n");
+        for (int b = 1; b <= 3; b++) {
+            volatile uint32_t *sd;
+            if (filter_block > 0 && b != filter_block)
+                continue;
+            sd = map_phys_prot(fd, sd_base[b], SD_MAP_LEN, PROT_READ | PROT_WRITE);
+            if (!sd) { rc = 1; continue; }
+            rc |= rx_kick_block(b, sd, kick_force);
+        }
+        close(fd);
+        return rc ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
 
     if (do_fec && fec_mac < 0) {
         /*
