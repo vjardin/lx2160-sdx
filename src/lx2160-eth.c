@@ -96,6 +96,10 @@ static const uint64_t sd_base[4] = { 0, 0x01EA0000UL, 0x01EB0000UL, 0x01EC0000UL
 #define SXGMII_CR3_FEC_LK       6
 #define SXGMII_CR3_HI_BER       4
 
+#define OFF_E25GCR2(l)          (0x1B00 + (l) * 0x10 + 0x8)
+#define E25G_CR2_FEC91_ENA      0x00100000u   /* RS-FEC (CL91) */
+#define E25G_CR2_FEC_ENA        0x00800000u   /* FC-FEC (CL74) */
+
 /* E25GaCR3 -- 25G single lane (RM SS26.4.1.64) */
 #define E25G_CR3_FEC_LK         16
 #define E25G_CR3_RSFEC_ALN      12
@@ -400,7 +404,7 @@ print_eth_lane(int sd_idx, const volatile uint32_t *sd, int lane,
  * Link bring-up ladder for one Ethernet port.
  */
 
-#define MAX_STAGES 8
+#define MAX_STAGES 9
 
 struct link_stage {
     const char *name;
@@ -443,13 +447,21 @@ lane_bits(uint32_t v, int n, char *out)
     out[i] = '\0';
 }
 
+static int
+proto_instance(int sd_idx, int first, int n)
+{
+    if (sd_idx == 1)
+        return (NUM_LANES - first - n) / n;
+    return first / n;
+}
+
 static void
 print_link_stages(int sd_idx, const volatile uint32_t *sd,
                   int first, int n, uint32_t gcr0, const char *cdr,
                   enum mode m)
 {
     uint32_t ps  = proto_sel(gcr0);
-    int      grp = (first >= 4);           /* "a" = LNA..LND, "b" = LNE..LNH */
+    int      inst = proto_instance(sd_idx, first, n);
     struct link_stage st[MAX_STAGES];
     int      ns = 0;
     uint32_t reg, off;
@@ -460,12 +472,18 @@ print_link_stages(int sd_idx, const volatile uint32_t *sd,
         if (cdr[i] != '1')
             cdr_all = false;
 
-    if      (ps == PROTO_25G && n == 4) { off = OFF_E100GCR3(grp);   regname = grp ? "E100GbCR3" : "E100GaCR3"; }
-    else if (ps == PROTO_25G && n == 2) { off = OFF_E50GCR3(grp);    regname = grp ? "E50GbCR3"  : "E50GaCR3";  }
-    else if (ps == PROTO_25G && n == 1) { off = OFF_E25GCR3(first);  regname = "E25GaCR3";  }
-    else if (ps == PROTO_10G && n == 4) { off = OFF_E40GCR3(grp);    regname = grp ? "E40GbCR3"  : "E40GaCR3";  }
-    else if (ps == PROTO_10G && n == 1) { off = OFF_SXGMIICR3(first);regname = "SXGMIIaCR3"; }
+    static char rn[16];
+
+    /* E100G/E40G have only two instances (a,b) and E50G two as well, so an
+     * out-of-range instance means the port shape is one this decode does
+     * not cover: say nothing rather than read an unrelated register. */
+    if      (ps == PROTO_25G && n == 4) { if (inst > 1) return; off = OFF_E100GCR3(inst); snprintf(rn, sizeof rn, "E100G%cCR3", 'a' + inst); }
+    else if (ps == PROTO_25G && n == 2) { if (inst > 1) return; off = OFF_E50GCR3(inst);  snprintf(rn, sizeof rn, "E50G%cCR3",  'a' + inst); }
+    else if (ps == PROTO_25G && n == 1) { off = OFF_E25GCR3(inst);   snprintf(rn, sizeof rn, "E25G%cCR3", 'a' + inst); }
+    else if (ps == PROTO_10G && n == 4) { if (inst > 1) return; off = OFF_E40GCR3(inst);  snprintf(rn, sizeof rn, "E40G%cCR3",  'a' + inst); }
+    else if (ps == PROTO_10G && n == 1) { off = OFF_SXGMIICR3(inst); snprintf(rn, sizeof rn, "SXGMII%cCR3", 'a' + inst); }
     else return;   /* 1G/PCIe/SATA have their own status paths */
+    regname = rn;
 
     reg = rd32(sd, off);
 
@@ -477,22 +495,21 @@ print_link_stages(int sd_idx, const volatile uint32_t *sd,
         uint32_t amps = (reg >> E100G_CR3_AMPS_LK_SHIFT)   & E100G_CR3_LANE_MASK;
         uint32_t aln  = (reg >> E100G_CR3_RSFEC_ALN_SHIFT) & E100G_CR3_LANE_MASK;
         uint32_t all  = (1u << n) - 1u;
-        uint32_t cr2  = rd32(sd, OFF_E100GCR2(grp));
+        uint32_t cr2  = rd32(sd, OFF_E100GCR2(inst));
         uint32_t fec  = (cr2 & E100G_CR2_FEC91_ENA) == E100G_CR2_FEC91_ENA;
         uint32_t vlbl = cr2 & E100G_CR2_BLOCK_LK_MASK;
         static char vlbuf[16], fecnote[40], blknote[48];
 
-        snprintf(fecnote, sizeof fecnote, "E100G%cCR2 FEC91_ENA", grp ? 'b' : 'a');
+        snprintf(fecnote, sizeof fecnote, "E100G%cCR2 FEC91_ENA", 'a' + inst);
         snprintf(blknote, sizeof blknote,
-                 "E100G%cCR2[19:0], n/a under RS-FEC", grp ? 'b' : 'a');
+                 "E100G%cCR2[19:0], n/a under RS-FEC", 'a' + inst);
         add_info(st, &ns, "RS-FEC enabled", fecnote,
                  fec, 1, true, fec ? "yes" : "no");
         add_stage(st, &ns, "RS-FEC codeword align",
                   "AMPS_LK (pre-deskew)",
                   amps, n, amps == all);
-        add_stage(st, &ns, "RS-FEC deskew+reorder",
-                  "RSFEC_ALN",
-                  aln, n, aln == all);
+        add_info(st, &ns, "RS-FEC deskew+reorder", "RSFEC_ALN",
+                 aln, n, aln == all, NULL);
         /* 20 virtual lanes; the RM marks this not relevant in RS-FEC mode. */
         snprintf(vlbuf, sizeof vlbuf, "%d/20", __builtin_popcount(vlbl));
         add_info(st, &ns, "64b/66b block lock", blknote,
@@ -517,11 +534,15 @@ print_link_stages(int sd_idx, const volatile uint32_t *sd,
                   "ALIGN_DN && !HI_BER",
                   bit(reg, E50G_CR3_LINK_ST), 1, bit(reg, E50G_CR3_LINK_ST));
     } else if (ps == PROTO_25G && n == 1) {
-        /* RM note on FEC_LK: FEC must lock before the PCS can synchronise,
-         * and that lock can take milliseconds -- do not read once and judge. */
-        add_stage(st, &ns, "RS-FEC lock",
-                  "FEC_LK (takes ms)",
-                  bit(reg, E25G_CR3_FEC_LK), 1, bit(reg, E25G_CR3_FEC_LK));
+        uint32_t cr2_25 = rd32(sd, OFF_E25GCR2(inst));
+        static char fecnote25[40];
+        const char *fecstr = (cr2_25 & E25G_CR2_FEC91_ENA) ? "rs" :
+                             (cr2_25 & E25G_CR2_FEC_ENA)   ? "fc" : "none";
+        snprintf(fecnote25, sizeof fecnote25, "E25G%cCR2 FEC_ENA", 'a' + inst);
+        add_info(st, &ns, "FEC enabled", fecnote25,
+                 cr2_25 & (E25G_CR2_FEC91_ENA | E25G_CR2_FEC_ENA), 1, true, fecstr);
+        add_info(st, &ns, "RS-FEC lock", "FEC_LK (never seen set)",
+                 bit(reg, E25G_CR3_FEC_LK), 1, bit(reg, E25G_CR3_FEC_LK), NULL);
         add_stage(st, &ns, "RS-FEC codeword align",
                   "AMPS_LK",
                   bit(reg, E25G_CR3_AMPS_LK), 1, bit(reg, E25G_CR3_AMPS_LK));
