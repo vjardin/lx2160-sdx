@@ -84,6 +84,35 @@ static const uint64_t sd_base[4] = { 0, 0x01EA0000UL, 0x01EB0000UL, 0x01EC0000UL
 #define PROTO_10G    0x0a   /* XFI/SFI/10GBase-R, 10GBase-KR, 10G-SXGMII, 40G */
 #define PROTO_25G    0x1a   /* 25GBase-R/KR, 50G, 100G (CAUI4) lanes */
 
+/*
+ * WRIOP MEMAC internal MDIO, used by --fec-mac to reach the RS-FEC
+ * codeword counters. Core-side WRIOP port space is 0x08C0_0000 (RM: the
+ * MC's own 0x28C0_0000 view is offset by 0x2000_0000); MEMAC n sits at
+ * 0x08C07000 + (n-1)*0x4000, and the MDIO block is at +0x30 within it.
+ */
+#define MEMAC_BASE(n)       (0x08C07000UL + ((uint64_t)(n) - 1) * 0x4000UL)
+#define MEMAC_MAP_LEN       0x1000UL
+#define OFF_MDIO_CFG        0x30
+#define OFF_MDIO_CTL        0x34
+#define OFF_MDIO_DATA       0x38
+#define OFF_MDIO_ADDR       0x3C
+#define MDIO_CTL_READ       0x8000u
+#define MDIO_CFG_BSY        0x1u
+#define MDIO_CFG_RD_ER      0x2u
+
+/* MDIO device addresses, RM Table 297 */
+#define MDD_PCS             3
+#define MDD_RSFEC           30
+
+/* RS-FEC registers, RM SS26.5.3.2.1.2.x -- CCW_LO must be read first, and
+ * the counters clear on read, so a reading is "since the last read". */
+#define RSFEC_STATUS        1
+#define RSFEC_CCW_LO        2
+#define RSFEC_CCW_HI        3
+#define RSFEC_NCCW_LO       4
+#define RSFEC_NCCW_HI       5
+#define RSFEC_STATUS_ALIGN  14      /* FEC_ALIGN_S: locked + deskew done */
+
 /* Ethernet protocol status registers */
 #define OFF_SXGMIICR3(l)    (0x1A80 + (l) * 0x10 + 0xC)
 #define OFF_E25GCR3(l)      (0x1B00 + (l) * 0x10 + 0xC)
@@ -137,7 +166,8 @@ struct eth_lane {
     int      lane;
     uint32_t expect;        /* expected PROTO_SEL class */
     const char *label;      /* per the protocol table */
-    const char *mac;        /* WRIOP MAC / dpmac id */
+    const char *mac;        /* WRIOP MAC / dpmac id, for display */
+    int      mac_id;        /* same, numeric, for --fec */
 };
 
 struct eth_map {
@@ -148,23 +178,23 @@ struct eth_map {
 };
 
 static const struct eth_map eth_maps[] = {
-    { 1, 13, 8, {
-        { 0, PROTO_25G, "100GE.1 lane 0", "MAC1 (CAUI4)" },
-        { 1, PROTO_25G, "100GE.1 lane 1", "MAC1 (CAUI4)" },
-        { 2, PROTO_25G, "100GE.1 lane 2", "MAC1 (CAUI4)" },
-        { 3, PROTO_25G, "100GE.1 lane 3", "MAC1 (CAUI4)" },
-        { 4, PROTO_25G, "100GE.2 lane 0", "MAC2 (CAUI4)" },
-        { 5, PROTO_25G, "100GE.2 lane 1", "MAC2 (CAUI4)" },
-        { 6, PROTO_25G, "100GE.2 lane 2", "MAC2 (CAUI4)" },
-        { 7, PROTO_25G, "100GE.2 lane 3", "MAC2 (CAUI4)" },
+    { .sd = 1, .proto = 13, .nlanes = 8, .lanes = {
+        { 0, PROTO_25G, "100GE.1 lane 0", "MAC2 (CAUI4)", 2 },
+        { 1, PROTO_25G, "100GE.1 lane 1", "MAC2 (CAUI4)", 2 },
+        { 2, PROTO_25G, "100GE.1 lane 2", "MAC2 (CAUI4)", 2 },
+        { 3, PROTO_25G, "100GE.1 lane 3", "MAC2 (CAUI4)", 2 },
+        { 4, PROTO_25G, "100GE.2 lane 0", "MAC1 (CAUI4)", 1 },
+        { 5, PROTO_25G, "100GE.2 lane 1", "MAC1 (CAUI4)", 1 },
+        { 6, PROTO_25G, "100GE.2 lane 2", "MAC1 (CAUI4)", 1 },
+        { 7, PROTO_25G, "100GE.2 lane 3", "MAC1 (CAUI4)", 1 },
     } },
-    { 2, 7, 6, {
-        { 1, PROTO_SGMII, "SGMII.12",   "MAC12" },
-        { 2, PROTO_SGMII, "SGMII.17",   "MAC17" },
-        { 3, PROTO_SGMII, "SGMII.18",   "MAC18" },
-        { 5, PROTO_SGMII, "SGMII.16",   "MAC16" },
-        { 6, PROTO_10G,   "USXGMII.13", "MAC13" },
-        { 7, PROTO_10G,   "USXGMII.14", "MAC14" },
+    { .sd = 2, .proto = 7, .nlanes = 6, .lanes = {
+        { 1, PROTO_SGMII, "SGMII.12",   "MAC12", 12 },
+        { 2, PROTO_SGMII, "SGMII.17",   "MAC17", 17 },
+        { 3, PROTO_SGMII, "SGMII.18",   "MAC18", 18 },
+        { 5, PROTO_SGMII, "SGMII.16",   "MAC16", 16 },
+        { 6, PROTO_10G,   "USXGMII.13", "MAC13", 13 },
+        { 7, PROTO_10G,   "USXGMII.14", "MAC14", 14 },
     } },
 };
 
@@ -951,6 +981,103 @@ static int jitter_scope_lane(volatile uint32_t *sd, int s, int lane,
     return 0;
 }
 
+/* One Clause-45 read on the MEMAC internal MDIO */
+static int mdio_wait(volatile uint32_t *mac)
+{
+    /* ~100 ms at any plausible MDC divider; a Clause-45 frame is ~50 us. */
+    for (int i = 0; i < 200000; i++)
+        if (!(rd32(mac, OFF_MDIO_CFG) & MDIO_CFG_BSY))
+            return 0;
+    return -1;
+}
+
+static int mdio_c45_read(volatile uint32_t *mac, int dev, uint16_t reg,
+                         uint16_t *out)
+{
+    uint32_t ctl = (uint32_t)dev;          /* port address 0 */
+
+    /*
+     * Every step has to wait for BSY. Omitting the waits appears to work
+     * when each access is a separate process (spawn latency covers the
+     * frame time) and fails outright in a tight loop, returning whatever
+     * MDIO_DATA held from the previous transaction.
+     */
+    if (mdio_wait(mac) < 0)
+        return -1;
+    wr32(mac, OFF_MDIO_CTL,  ctl);
+    wr32(mac, OFF_MDIO_ADDR, reg);         /* address cycle */
+    if (mdio_wait(mac) < 0)
+        return -1;
+    wr32(mac, OFF_MDIO_CTL,  ctl | MDIO_CTL_READ);
+    if (mdio_wait(mac) < 0)
+        return -1;
+    if (rd32(mac, OFF_MDIO_CFG) & MDIO_CFG_RD_ER)
+        return -1;                         /* device did not respond */
+    *out = (uint16_t)rd32(mac, OFF_MDIO_DATA);
+    return 0;
+}
+
+/*
+ * RS-FEC corrected / uncorrected codeword counters for one WRIOP MAC.
+ *
+ * This is the pre-FEC margin instrument: HI_BER only tells you the link
+ * has crossed a threshold, while these say how hard FEC was working
+ * before it did. Zero corrected AND zero uncorrected means the channel is
+ * error-free, not merely linked.
+ */
+static int fec_counters(volatile uint32_t *mac, int mac_id, enum mode m)
+{
+    uint32_t saved = rd32(mac, OFF_MDIO_CTL);
+    uint32_t ccw, nccw;
+    uint16_t lo = 0, hi = 0, st = 0;
+    int err = mdio_c45_read(mac, MDD_RSFEC, RSFEC_STATUS, &st);
+
+    if (err < 0 || st == 0) {
+        /* Cross-check that the MDIO itself works before blaming the MMD. */
+        uint16_t pcs = 0;
+        (void)mdio_c45_read(mac, MDD_PCS, 0x20, &pcs);
+        wr32(mac, OFF_MDIO_CTL, saved);
+        if (m == MODE_QUIET)
+            printf("MAC%d FEC no-rsfec-mmd pcs_baser_status1=0x%04x\n", mac_id, pcs);
+        else
+            printf("  MAC%-2d  no RS-FEC MMD response (device %d silent; "
+                   "PCS device %d reads 0x%04x)\n"
+                   "         RS-FEC is configured in the PCS vendor window on this MAC;\n"
+                   "         codeword counters are not exposed there.\n",
+                   mac_id, MDD_RSFEC, MDD_PCS, pcs);
+        return 2;
+    }
+
+    err  = mdio_c45_read(mac, MDD_RSFEC, RSFEC_CCW_LO, &lo);  /* LO first */
+    err |= mdio_c45_read(mac, MDD_RSFEC, RSFEC_CCW_HI, &hi);
+    ccw = ((uint32_t)hi << 16) | lo;
+    err |= mdio_c45_read(mac, MDD_RSFEC, RSFEC_NCCW_LO, &lo);
+    err |= mdio_c45_read(mac, MDD_RSFEC, RSFEC_NCCW_HI, &hi);
+    nccw = ((uint32_t)hi << 16) | lo;
+    if (err < 0) {
+        wr32(mac, OFF_MDIO_CTL, saved);
+        warnx("MAC%d: MDIO read error while fetching counters", mac_id);
+        return 1;
+    }
+
+    wr32(mac, OFF_MDIO_CTL, saved);
+
+    if (m == MODE_QUIET) {
+        printf("MAC%d FEC status=0x%04x align=%u corrected=%u uncorrected=%u\n",
+               mac_id, st, bit(st, RSFEC_STATUS_ALIGN), ccw, nccw);
+    } else {
+        printf("  MAC%-2d  RS_FEC_STATUS=0x%04x  FEC_ALIGN_S=%u (%s)\n",
+               mac_id, st, bit(st, RSFEC_STATUS_ALIGN),
+               bit(st, RSFEC_STATUS_ALIGN)
+                   ? "locked, deskew complete"
+                   : "not aligned -- normal where RS-FEC is not in use");
+        printf("         corrected codewords   = %-10u  (CCW)\n", ccw);
+        printf("         uncorrected codewords = %-10u  (NCCW)\n", nccw);
+        printf("         counters cleared by this read -- next read is the delta\n");
+    }
+    return (nccw != 0) ? 1 : 0;
+}
+
 static int parse_lane(const char *a)
 {
     if (!a || !*a)
@@ -976,6 +1103,12 @@ usage(const char *argv0)
         "  -b, --block N    Only report SerDes block N (1..3)\n"
         "  -q, --quiet      One line per Ethernet lane (parse-friendly)\n"
         "      --stages     Also emit the per-port link-stage ladder in --quiet\n"
+        "      --fec        RS-FEC corrected/uncorrected codeword counters for\n"
+        "                   every MAC of the selected block(s), MACs derived\n"
+        "                   from the protocol table. Counters clear on read\n"
+        "      --fec-mac N  Same, for WRIOP MAC N (1..18) explicitly. Needed\n"
+        "                   when a PBI re-shaped the lanes, so the protocol\n"
+        "                   table does not describe the board\n"
         "                   (always shown in the default human report)\n"
         "  -h, --help       Show this help and exit\n"
         "\n"
@@ -999,17 +1132,21 @@ main(int argc, char **argv)
     int filter_block = -1;
     enum mode m = MODE_HUMAN;
     bool do_eqbins = false, do_js = false, want_stages = false;
+    int  fec_mac = -1;
+    bool do_fec  = false;
     int diag_lane = -1;
     uint32_t js_mode = TST_PIJITTER;
     unsigned js_step = 8, js_dwell = 2000;
 
     enum { OPT_EQBINS = 1000, OPT_JS, OPT_LANE, OPT_JSMODE, OPT_JSSTEP,
-           OPT_JSDWELL, OPT_STAGES };
+           OPT_JSDWELL, OPT_STAGES, OPT_FECMAC, OPT_FEC };
     static const struct option longopts[] = {
         { "block",        required_argument, NULL, 'b' },
         { "quiet",        no_argument,       NULL, 'q' },
         { "help",         no_argument,       NULL, 'h' },
         { "stages",       no_argument,       NULL, OPT_STAGES },
+        { "fec",          no_argument,       NULL, OPT_FEC },
+        { "fec-mac",      required_argument, NULL, OPT_FECMAC },
         { "eq-bins",      no_argument,       NULL, OPT_EQBINS },
         { "jitter-scope", no_argument,       NULL, OPT_JS },
         { "lane",         required_argument, NULL, OPT_LANE },
@@ -1029,6 +1166,12 @@ main(int argc, char **argv)
             break;
         case 'q': m = MODE_QUIET; break;
         case OPT_STAGES: want_stages = true; break;
+        case OPT_FEC: do_fec = true; break;
+        case OPT_FECMAC:
+            fec_mac = atoi(optarg);
+            if (fec_mac < 1 || fec_mac > 18)
+                errx(EXIT_USAGE, "--fec-mac must be a WRIOP MAC id 1..18");
+            break;
         case OPT_EQBINS: do_eqbins = true; break;
         case OPT_JS: do_js = true; break;
         case OPT_LANE:
@@ -1057,13 +1200,89 @@ main(int argc, char **argv)
         }
     }
 
-    bool diag = do_eqbins || do_js;
+    bool diag = do_eqbins || do_js || fec_mac > 0 || do_fec;
     if (do_js && diag_lane < 0)
         errx(EXIT_USAGE, "--jitter-scope needs --lane");
 
     int fd = open("/dev/mem", (diag ? O_RDWR : O_RDONLY) | O_SYNC);
     if (fd < 0)
         err(EXIT_FAILURE, "open /dev/mem (need root)");
+
+    if (do_fec && fec_mac < 0) {
+        /*
+         * Derive the MACs from the protocol table rather than making the
+         * caller name them. Only possible where the (block, protocol)
+         * pair is known: a PBI that re-shapes lanes after reset - the
+         * NBV32 100G split, say - has no table entry, and guessing a MAC
+         * id there reads a MEMAC that may not belong to any port at all.
+         * Say so and let --fec-mac override.
+         */
+        int seen[19] = { 0 };
+        int found = 0, rc_fec = 0;
+        uint32_t proto[4] = { 0 };
+        volatile uint32_t *dcfg0 = map_phys(fd, DCFG_BASE, DCFG_MAP_LEN);
+
+        if (!dcfg0)
+            return EXIT_FAILURE;
+        {
+            uint32_t r29 = rd32(dcfg0, OFF_RCWSR29);
+            proto[1] = (r29 >> 16) & 0x1fu;
+            proto[2] = (r29 >> 21) & 0x1fu;
+            proto[3] = (r29 >> 26) & 0x1fu;
+        }
+
+        for (int s = 1; s <= 3; s++) {
+            const struct eth_map *em = NULL;
+
+            if (filter_block > 0 && s != filter_block)
+                continue;
+            for (size_t i = 0; i < sizeof(eth_maps) / sizeof(eth_maps[0]); i++)
+                if (eth_maps[i].sd == s && eth_maps[i].proto == proto[s])
+                    em = &eth_maps[i];
+            if (!em)
+                continue;
+
+            for (int i = 0; i < em->nlanes; i++) {
+                int id = em->lanes[i].mac_id;
+
+                if (id < 1 || id > 18 || seen[id])
+                    continue;         /* one read per MAC, not per lane */
+                seen[id] = 1;
+                found++;
+                volatile uint32_t *mac = map_phys_prot(fd, MEMAC_BASE(id),
+                                                       MEMAC_MAP_LEN,
+                                                       PROT_READ | PROT_WRITE);
+                if (!mac)
+                    continue;
+                if (m == MODE_HUMAN)
+                    printf("SD%d %s:\n", s, em->lanes[i].label);
+                if (fec_counters(mac, id, m) == 1)
+                    rc_fec = 1;
+            }
+        }
+        if (!found)
+            warnx("no known protocol map for the selected block(s); "
+                  "name the MAC explicitly with --fec-mac N");
+        close(fd);
+        if (!found)
+            return EXIT_FAILURE;
+        return rc_fec ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+
+    if (fec_mac > 0) {
+        /* WRIOP MEMAC, not a SerDes block -- its own mapping. */
+        volatile uint32_t *mac = map_phys_prot(fd, MEMAC_BASE(fec_mac),
+                                               MEMAC_MAP_LEN,
+                                               PROT_READ | PROT_WRITE);
+        if (!mac)
+            return EXIT_FAILURE;
+        if (m == MODE_HUMAN)
+            printf("RS-FEC codeword counters (MDIO device %d via MEMAC 0x%08lx):\n",
+                   MDD_RSFEC, (unsigned long)MEMAC_BASE(fec_mac));
+        int rc = fec_counters(mac, fec_mac, m);
+        close(fd);
+        return rc ? EXIT_FAILURE : EXIT_SUCCESS;   /* asked for it, so absence is an error */
+    }
 
     if (diag) {
         int s = filter_block > 0 ? filter_block : 1;
