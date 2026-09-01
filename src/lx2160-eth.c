@@ -1225,6 +1225,386 @@ static int fec_counters(volatile uint32_t *mac, int mac_id, enum mode m)
     return (nccw != 0) ? 1 : 0;
 }
 
+/*
+ * For TX FIR (LNmTECR0) get/set: 6 fields, exactly the set the DPC
+ * expresses as
+ *   serdes_eq / serdes_sgn_preq / serdes_preq /
+  *  erdes_sgn_post1q / serdes_post1q / serdes_amp
+ * and exactly the set
+ * lynx_28g_proto_conf[] is from the kernel.
+ * LNmTECR1 (4-tap adaptive) is deliberately out of scope: TBC
+ *
+ * The master source-clock lane must be reset AFTER every other lane
+ * in its group.
+ */
+
+#define TECR0_EQ_TYPE_SH      28
+#define TECR0_EQ_TYPE_MSK     0x7u
+#define TECR0_SGN_PREQ_SH     23
+#define TECR0_EQ_PREQ_SH      16
+#define TECR0_EQ_PREQ_MSK     0xfu
+#define TECR0_SGN_POST1Q_SH   15
+#define TECR0_EQ_POST1Q_SH    8
+#define TECR0_EQ_POST1Q_MSK   0x1fu
+#define TECR0_EQ_AMP_RED_SH   0
+#define TECR0_EQ_AMP_RED_MSK  0x3fu
+
+#define LN_TRST_HLT_REQ       27
+
+enum {
+    TXF_TYPE = 1u << 0, TXF_SGNPRE = 1u << 1, TXF_PREQ    = 1u << 2,
+    TXF_SGNPOST = 1u << 3, TXF_POST1Q = 1u << 4, TXF_AMP  = 1u << 5,
+};
+#define TXF_ALL  (TXF_TYPE|TXF_SGNPRE|TXF_PREQ|TXF_SGNPOST|TXF_POST1Q|TXF_AMP)
+
+struct tx_fir {
+    unsigned eq_type, sgn_preq, preq, sgn_post1q, post1q, amp_red;
+    unsigned have; /* which of the above are set */
+};
+
+/* de-emphasis ratio. 0x0d..0x1f are not defined. */
+static const char *post1q_ratio(unsigned v)
+{
+    static const char *const r[] = {
+        "1.00", "1.04", "1.09", "1.14", "1.20", "1.26", "1.33",
+        "1.40", "1.50", "1.60", "1.71", "1.84", "2.00",
+    };
+    return v < sizeof(r) / sizeof(r[0]) ? r[v] : "??";
+}
+
+/* sparse, so unlisted codes report raw. */
+static const char *amp_red_ratio(unsigned v)
+{
+    switch (v) {
+    case 0x00: return "1.0";    case 0x01: return "0.917";
+    case 0x02: return "0.752";  case 0x03: return "0.840";
+    case 0x06: return "0.667";  case 0x07: return "0.585";
+    case 0x10: return "0.500";  case 0x11: return "0.458";
+    case 0x12: return "0.376";  case 0x13: return "0.420";
+    case 0x16: return "0.333";  case 0x17: return "0.292";
+    case 0x1f: return "0.170";  case 0x20: return "1.1x";
+    default:   return "??";
+    }
+}
+
+static const char *eq_type_str(unsigned v)
+{
+    switch (v) {
+    case 0:  return "none";
+    case 1:  return "2-tap";
+    case 2:  return "3-tap";
+    default: return "rsvd";
+    }
+}
+
+static void tecr0_unpack(uint32_t v, struct tx_fir *f)
+{
+    f->eq_type    = (v >> TECR0_EQ_TYPE_SH)     & TECR0_EQ_TYPE_MSK;
+    f->sgn_preq   = (v >> TECR0_SGN_PREQ_SH)    & 1u;
+    f->preq       = (v >> TECR0_EQ_PREQ_SH)     & TECR0_EQ_PREQ_MSK;
+    f->sgn_post1q = (v >> TECR0_SGN_POST1Q_SH)  & 1u;
+    f->post1q     = (v >> TECR0_EQ_POST1Q_SH)   & TECR0_EQ_POST1Q_MSK;
+    f->amp_red    = (v >> TECR0_EQ_AMP_RED_SH)  & TECR0_EQ_AMP_RED_MSK;
+    f->have       = TXF_ALL;
+}
+
+static uint32_t tecr0_pack(uint32_t cur, const struct tx_fir *want)
+{
+    uint32_t v = cur;
+
+    if (want->have & TXF_TYPE) {
+        v &= ~((uint32_t)TECR0_EQ_TYPE_MSK << TECR0_EQ_TYPE_SH);
+        v |= (want->eq_type & TECR0_EQ_TYPE_MSK) << TECR0_EQ_TYPE_SH;
+    }
+    if (want->have & TXF_SGNPRE) {
+        v &= ~(1u << TECR0_SGN_PREQ_SH);
+        v |= (want->sgn_preq & 1u) << TECR0_SGN_PREQ_SH;
+    }
+    if (want->have & TXF_PREQ) {
+        v &= ~((uint32_t)TECR0_EQ_PREQ_MSK << TECR0_EQ_PREQ_SH);
+        v |= (want->preq & TECR0_EQ_PREQ_MSK) << TECR0_EQ_PREQ_SH;
+    }
+    if (want->have & TXF_SGNPOST) {
+        v &= ~(1u << TECR0_SGN_POST1Q_SH);
+        v |= (want->sgn_post1q & 1u) << TECR0_SGN_POST1Q_SH;
+    }
+    if (want->have & TXF_POST1Q) {
+        v &= ~((uint32_t)TECR0_EQ_POST1Q_MSK << TECR0_EQ_POST1Q_SH);
+        v |= (want->post1q & TECR0_EQ_POST1Q_MSK) << TECR0_EQ_POST1Q_SH;
+    }
+    if (want->have & TXF_AMP) {
+        v &= ~((uint32_t)TECR0_EQ_AMP_RED_MSK << TECR0_EQ_AMP_RED_SH);
+        v |= (want->amp_red & TECR0_EQ_AMP_RED_MSK) << TECR0_EQ_AMP_RED_SH;
+    }
+    return v;
+}
+
+/* The port group a lane belongs to, and which lane is its master. */
+struct port_grp { int first, n, master; };
+
+static void tx_fir_group(const volatile uint32_t *sd, int lane,
+                         struct port_grp *g)
+{
+    uint32_t gcr0[NUM_LANES];
+    int a = 0;
+
+    for (int i = 0; i < NUM_LANES; i++)
+        gcr0[i] = lane_reg(sd, OFF_LANE_GCR0, i);
+
+    while (a < NUM_LANES) {
+        int first = a, n = 1;
+        bool left = bit(gcr0[first], LN_GCR0_PORT_RST_LEFT) == 1;
+
+        if (left) {
+            while (first + n < NUM_LANES &&
+                   bit(gcr0[first+n], LN_GCR0_PORT_LN0_B) == 1 &&
+                   proto_sel(gcr0[first+n]) == proto_sel(gcr0[first])) n++;
+        } else {
+            while (bit(gcr0[first+n-1], LN_GCR0_PORT_LN0_B) == 1 &&
+                   first + n < NUM_LANES &&
+                   proto_sel(gcr0[first+n]) == proto_sel(gcr0[first])) n++;
+        }
+        a = first + n;
+
+        if (lane >= first && lane < first + n) {
+            g->first = first;
+            g->n = n;
+            g->master = first;
+            for (int i = 0; i < n; i++)
+                if (bit(gcr0[first+i], LN_GCR0_PORT_LN0_B) == 0)
+                    g->master = first + i;
+            return;
+        }
+    }
+    g->first = lane; g->n = 1; g->master = lane;   /* unreachable in practice */
+}
+
+static void tx_fir_print_lane(int sd_idx, const volatile uint32_t *sd,
+                              int lane, enum mode m)
+{
+    uint32_t v = lane_reg(sd, OFF_LANE_TECR0, lane);
+    struct port_grp g;
+    struct tx_fir f;
+
+    tecr0_unpack(v, &f);
+    tx_fir_group(sd, lane, &g);
+
+    if (m == MODE_QUIET) {
+        printf("SD%d LN%c TECR0=0x%08x eq_type=%u sgn_preq=%u preq=%u "
+               "sgn_post1q=%u post1q=%u amp_red=%u ratio=%s amp=%s "
+               "port=LN%c-LN%c master=LN%c\n",
+               sd_idx, 'A'+lane, v, f.eq_type, f.sgn_preq, f.preq,
+               f.sgn_post1q, f.post1q, f.amp_red,
+               post1q_ratio(f.post1q), amp_red_ratio(f.amp_red),
+               'A'+g.first, 'A'+g.first+g.n-1, 'A'+g.master);
+        return;
+    }
+    printf("  LN%c  0x%08x  %-5s  preq=%s%u  post1q=%s%2u (%s)  "
+           "amp=0x%02x (%s)  port LN%c-LN%c master LN%c\n",
+           'A'+lane, v, eq_type_str(f.eq_type),
+           f.sgn_preq ? "+" : "-", f.preq,
+           f.sgn_post1q ? "+" : "-", f.post1q, post1q_ratio(f.post1q),
+           f.amp_red, amp_red_ratio(f.amp_red),
+           'A'+g.first, 'A'+g.first+g.n-1, 'A'+g.master);
+}
+
+static void tx_fir_json_lane(int sd_idx, const volatile uint32_t *sd,
+                             int lane, bool first_in_block)
+{
+    uint32_t v = lane_reg(sd, OFF_LANE_TECR0, lane);
+    struct tx_fir f;
+
+    (void)sd_idx;
+    tecr0_unpack(v, &f);
+    printf("%s\n    \"LN%c\": { \"tecr0\": \"0x%08x\", \"eq_type\": %u, "
+           "\"sgn_preq\": %u, \"preq\": %u, \"sgn_post1q\": %u, "
+           "\"post1q\": %u, \"amp_red\": %u }",
+           first_in_block ? "" : ",", 'A'+lane, v, f.eq_type, f.sgn_preq,
+           f.preq, f.sgn_post1q, f.post1q, f.amp_red);
+}
+
+static bool tx_fir_port_up(int sd_idx, const volatile uint32_t *sd,
+                           const struct port_grp *g)
+{
+    uint32_t off = 0, gcr0 = lane_reg(sd, OFF_LANE_GCR0, g->first);
+    char nm[16];
+    enum ps_kind k = port_status_reg(sd_idx, proto_sel(gcr0), g->first, g->n,
+                                     &off, nm, sizeof nm);
+
+    switch (k) {
+    case PSK_E100G: return bit(rd32(sd, off), E100G_CR3_LINK_ST) != 0;
+    case PSK_E50G:  return bit(rd32(sd, off), E50G_CR3_LINK_ST)  != 0;
+    case PSK_E25G:  return bit(rd32(sd, off), E25G_CR3_LINK_ST)  != 0;
+    default:        return true;
+    }
+}
+
+/* Wait for the port to come back, and un-latch it if it does not. */
+static int tx_fir_relink(volatile uint32_t *sd, int sd_idx,
+                         const struct port_grp *g)
+{
+    uint32_t gcr0 = lane_reg(sd, OFF_LANE_GCR0, g->first);
+    char cdr[NUM_LANES + 1];
+    const char *why = "";
+
+    /* heuristics */
+    for (int i = 0; i < 50; i++) { /* up to 5s */
+        if (tx_fir_port_up(sd_idx, sd, g))
+            return 0;
+        usleep(100000);
+    }
+
+    for (int i = 0; i < g->n; i++)
+        cdr[i] = bit(lane_reg(sd, OFF_LANE_RRSTCTL, g->first + i),
+                     LN_RRSTCTL_CDR_LOCK) ? '1' : '0';
+    cdr[g->n] = '\0';
+
+    if (!port_is_stuck(sd_idx, sd, g->first, g->n, gcr0, cdr, &why)) {
+        warnx("SD%d LN%c-LN%c: still down after the reset (CDR=%s) -- %s",
+              sd_idx, 'A'+g->first, 'A'+g->first+g->n-1, cdr, why);
+        return 1;
+    }
+
+    printf("  LN%c-LN%c latched (CDR=%s, LINK_ST=0): un-halted RX reset\n",
+           'A'+g->first, 'A'+g->first+g->n-1, cdr);
+    rx_kick_port(sd, g->first, g->n);
+
+    /* heuristics */
+    for (int i = 0; i < 100; i++) { /* up to 10 s */
+        if (tx_fir_port_up(sd_idx, sd, g)) {
+            printf("  LN%c-LN%c relinked\n",
+                   'A'+g->first, 'A'+g->first+g->n-1);
+            return 0;
+        }
+        usleep(100000);
+    }
+    warnx("SD%d LN%c-LN%c: did not relink after the RX reset -- look at the "
+          "link partner", sd_idx, 'A'+g->first, 'A'+g->first+g->n-1);
+    return 1;
+}
+
+/*
+ * Halt -> change -> reset for one port group
+ *
+ * It bounces the link, every time, by construction.
+ */
+static int tx_fir_apply_group(volatile uint32_t *sd, int sd_idx,
+                              const struct port_grp *g,
+                              const struct tx_fir *want, bool dry)
+{
+    uint32_t newv[NUM_LANES];
+    int changed = 0;
+
+    for (int i = 0; i < g->n; i++) {
+        int l = g->first + i;
+        uint32_t cur = lane_reg(sd, OFF_LANE_TECR0, l);
+
+        newv[i] = tecr0_pack(cur, want);
+        printf("  SD%d LN%c  TECR0 0x%08x -> 0x%08x%s\n", sd_idx, 'A'+l,
+               cur, newv[i], cur == newv[i] ? "  (no change)" : "");
+        if (cur != newv[i])
+            changed++;
+    }
+    if (dry)
+        return 0; /* caller says "nothing written", once */
+    if (!changed) {
+        printf("  already at the requested value, not bouncing the link\n");
+        return 0;
+    }
+
+    for (int i = 0; i < g->n; i++) { /* halt */
+        int l = g->first + i;
+        lane_wr(sd, OFF_LANE_TRSTCTL, l,
+                lane_reg(sd, OFF_LANE_TRSTCTL, l) | (1u << LN_TRST_HLT_REQ));
+        lane_wr(sd, OFF_LANE_RRSTCTL, l,
+                lane_reg(sd, OFF_LANE_RRSTCTL, l) | (1u << LN_TRST_HLT_REQ));
+    }
+    for (int i = 0; i < g->n; i++) { /* wait for HW to clear it */
+        int l = g->first + i, spin = 0;
+
+        while (bit(lane_reg(sd, OFF_LANE_TRSTCTL, l), LN_TRST_HLT_REQ)) {
+            if (++spin > 10000) {
+                warnx("SD%d LN%c: HLT_REQ never cleared, aborting before the write",
+                      sd_idx, 'A'+l);
+                return 1;
+            }
+            usleep(100);
+        }
+    }
+    for (int i = 0; i < g->n; i++) /* change */
+        lane_wr(sd, OFF_LANE_TECR0, g->first + i, newv[i]);
+
+    for (int i = 0; i < g->n; i++) { /* reset, master LAST */
+        int l = g->first + i;
+        if (l == g->master)
+            continue;
+        lane_wr(sd, OFF_LANE_TRSTCTL, l,
+                lane_reg(sd, OFF_LANE_TRSTCTL, l) | (1u << LN_RST_REQ));
+        lane_wr(sd, OFF_LANE_RRSTCTL, l,
+                lane_reg(sd, OFF_LANE_RRSTCTL, l) | (1u << LN_RST_REQ));
+    }
+    lane_wr(sd, OFF_LANE_TRSTCTL, g->master,
+            lane_reg(sd, OFF_LANE_TRSTCTL, g->master) | (1u << LN_RST_REQ));
+    lane_wr(sd, OFF_LANE_RRSTCTL, g->master,
+            lane_reg(sd, OFF_LANE_RRSTCTL, g->master) | (1u << LN_RST_REQ));
+
+    printf("  applied to LN%c-LN%c (master LN%c reset last); link bounced\n",
+           'A'+g->first, 'A'+g->first+g->n-1, 'A'+g->master);
+
+    return tx_fir_relink(sd, sd_idx, g);
+}
+
+static bool tx_fir_lane_ok(const volatile uint32_t *sd, int sd_idx, int lane)
+{
+    uint32_t ps = proto_sel(lane_reg(sd, OFF_LANE_GCR0, lane));
+
+    if (is_eth(ps))
+        return true;
+    warnx("SD%d LN%c: PROTO_SEL=0x%02x is not Ethernet -- TECR0 is read-only "
+          "there (RM SS26.4.1.15), refusing", sd_idx, 'A'+lane, ps);
+    return false;
+}
+
+/* "post1q=0,amp_red=0x20" or "tecr0=0x20828020": later win. */
+static int tx_fir_parse_spec(const char *spec, struct tx_fir *f)
+{
+    char buf[256];
+    char *save = NULL, *tok;
+
+    if (strlen(spec) >= sizeof buf) {
+        warnx("--tx-fir-set spec too long");
+        return -1;
+    }
+    snprintf(buf, sizeof buf, "%s", spec);
+    f->have = 0;
+
+    for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        char *eq = strchr(tok, '=');
+        unsigned long v;
+        char *endp;
+
+        while (*tok == ' ') tok++;
+        if (!eq) { warnx("bad spec item '%s', want key=value", tok); return -1; }
+        *eq = '\0';
+        errno = 0;
+        v = strtoul(eq + 1, &endp, 0);
+        if (errno || endp == eq + 1 || *endp) {
+            warnx("bad value '%s' for '%s'", eq + 1, tok);
+            return -1;
+        }
+        if      (!strcmp(tok, "tecr0"))      { tecr0_unpack((uint32_t)v, f); }
+        else if (!strcmp(tok, "eq_type"))    { f->eq_type    = (unsigned)v; f->have |= TXF_TYPE; }
+        else if (!strcmp(tok, "sgn_preq"))   { f->sgn_preq   = (unsigned)v; f->have |= TXF_SGNPRE; }
+        else if (!strcmp(tok, "preq"))       { f->preq       = (unsigned)v; f->have |= TXF_PREQ; }
+        else if (!strcmp(tok, "sgn_post1q")) { f->sgn_post1q = (unsigned)v; f->have |= TXF_SGNPOST; }
+        else if (!strcmp(tok, "post1q"))     { f->post1q     = (unsigned)v; f->have |= TXF_POST1Q; }
+        else if (!strcmp(tok, "amp_red"))    { f->amp_red    = (unsigned)v; f->have |= TXF_AMP; }
+        else { warnx("unknown TX FIR field '%s'", tok); return -1; }
+    }
+    if (!f->have) { warnx("--tx-fir-set: nothing to set"); return -1; }
+    return 0;
+}
+
 static int parse_lane(const char *a)
 {
     if (!a || !*a)
@@ -1238,6 +1618,257 @@ static int parse_lane(const char *a)
     if (a[0] >= '0' && a[0] <= '7' && !a[1])
         return a[0] - '0';
     return -1;
+}
+
+/*
+ * quick json to avoid dependencies.
+ */
+
+typedef int (*js_leaf_fn)(const char *path, const char *tok, void *ctx);
+
+static const char *js_ws(const char *p, const char *e)
+{
+    while (p < e && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+        p++;
+    return p;
+}
+
+static const char *js_str(const char *p, const char *e, char *out, size_t osz)
+{
+    size_t n = 0;
+
+    if (p >= e || *p != '"')
+        return NULL;
+    p++;
+    while (p < e && *p != '"') {
+        char c = *p++;
+
+        if (c == '\\') {
+            if (p >= e)
+                return NULL;
+            switch (*p++) {
+            case '"':  c = '"';  break;
+            case '\\': c = '\\'; break;
+            case '/':  c = '/';  break;
+            case 'n':  c = '\n'; break;
+            case 't':  c = '\t'; break;
+            case 'r':  c = '\r'; break;
+            case 'b':  c = '\b'; break;
+            case 'f':  c = '\f'; break;
+            default:   return NULL;      /* \u not needed by this schema */
+            }
+        }
+        if (n + 1 < osz)
+            out[n++] = c;
+    }
+    if (p >= e)
+        return NULL;
+    out[n] = '\0';
+    return p + 1;
+}
+
+static const char *js_value(const char *p, const char *e, char *path,
+                            size_t pathsz, size_t plen,
+                            js_leaf_fn cb, void *ctx, int *rc)
+{
+    char tok[128];
+
+    p = js_ws(p, e);
+    if (p >= e)
+        return NULL;
+
+    if (*p == '[') {
+        int idx = 0;
+
+        p = js_ws(p + 1, e);
+        if (p < e && *p == ']')
+            return p + 1;
+        for (;;) {
+            size_t nl = plen;
+            char ix[16];
+
+            snprintf(ix, sizeof ix, "%d", idx++);
+            if (nl && nl + 1 < pathsz)
+                path[nl++] = '.';
+            for (const char *k = ix; *k && nl + 1 < pathsz; k++)
+                path[nl++] = *k;
+            path[nl] = '\0';
+
+            p = js_value(p, e, path, pathsz, nl, cb, ctx, rc);
+            if (!p)
+                return NULL;
+            path[plen] = '\0';
+
+            p = js_ws(p, e);
+            if (p < e && *p == ',') { p = js_ws(p + 1, e); continue; }
+            if (p < e && *p == ']') return p + 1;
+            return NULL;
+        }
+    }
+    if (*p == '{') {
+        p = js_ws(p + 1, e);
+        if (p < e && *p == '}')
+            return p + 1;
+        for (;;) {
+            char key[64];
+            size_t nl;
+
+            p = js_ws(p, e);
+            p = js_str(p, e, key, sizeof key);
+            if (!p)
+                return NULL;
+            p = js_ws(p, e);
+            if (p >= e || *p != ':')
+                return NULL;
+
+            nl = plen;
+            if (nl && nl + 1 < pathsz)
+                path[nl++] = '.';
+            for (const char *k = key; *k && nl + 1 < pathsz; k++)
+                path[nl++] = *k;
+            path[nl] = '\0';
+
+            p = js_value(p + 1, e, path, pathsz, nl, cb, ctx, rc);
+            if (!p)
+                return NULL;
+            path[plen] = '\0';
+
+            p = js_ws(p, e);
+            if (p < e && *p == ',') { p++; continue; }
+            if (p < e && *p == '}') return p + 1;
+            return NULL;
+        }
+    }
+    if (*p == '"') {
+        p = js_str(p, e, tok, sizeof tok);
+        if (!p)
+            return NULL;
+    } else {
+        size_t n = 0;
+        while (p < e && *p != ',' && *p != '}' && *p != ']' &&
+               *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+            if (n + 1 < sizeof tok)
+                tok[n++] = *p;
+            p++;
+        }
+        tok[n] = '\0';
+        if (!n)
+            return NULL;
+    }
+    if (cb(path, tok, ctx) != 0)
+        *rc = 1;
+    return p;
+}
+
+struct txf_load {
+    struct tx_fir lane[4][NUM_LANES];
+    bool          present[4][NUM_LANES];
+};
+
+static int txf_json_leaf(const char *path, const char *tok, void *ctx)
+{
+    struct txf_load *L = ctx;
+    struct tx_fir *f;
+    unsigned long v;
+    char field[32];
+    char lnc = 0;
+    char *endp;
+    int sd = 0, lane;
+
+    /* Anything not under "sdN" is free-form: comments, provenance, dates. */
+    if (sscanf(path, "sd%d.LN%c.%31s", &sd, &lnc, field) != 3)
+        return 0;
+    if (sd < 1 || sd > 3) {
+        warnx("JSON: '%s': SerDes block must be 1..3", path);
+        return 1;
+    }
+    if (lnc < 'A' || lnc > 'H') {
+        warnx("JSON: '%s': lane must be LNA..LNH", path);
+        return 1;
+    }
+    lane = lnc - 'A';
+
+    errno = 0;
+    v = strtoul(tok, &endp, 0);
+    if (errno || endp == tok || *endp) {
+        warnx("JSON: '%s': bad value '%s'", path, tok);
+        return 1;
+    }
+
+    f = &L->lane[sd][lane];
+    if (!L->present[sd][lane]) {
+        L->present[sd][lane] = true;
+        f->have = 0;
+    }
+    /* Later keys win, as in --tx-fir-set. "tecr0" carries all six fields,
+     * so a "tecr0" after a field discards that field: put it first. */
+    if      (!strcmp(field, "tecr0"))      { tecr0_unpack((uint32_t)v, f); }
+    else if (!strcmp(field, "eq_type"))    { f->eq_type    = (unsigned)v; f->have |= TXF_TYPE; }
+    else if (!strcmp(field, "sgn_preq"))   { f->sgn_preq   = (unsigned)v; f->have |= TXF_SGNPRE; }
+    else if (!strcmp(field, "preq"))       { f->preq       = (unsigned)v; f->have |= TXF_PREQ; }
+    else if (!strcmp(field, "sgn_post1q")) { f->sgn_post1q = (unsigned)v; f->have |= TXF_SGNPOST; }
+    else if (!strcmp(field, "post1q"))     { f->post1q     = (unsigned)v; f->have |= TXF_POST1Q; }
+    else if (!strcmp(field, "amp_red"))    { f->amp_red    = (unsigned)v; f->have |= TXF_AMP; }
+    else {
+        warnx("JSON: '%s': unknown TX FIR field '%s'", path, field);
+        return 1;
+    }
+    return 0;
+}
+
+static int txf_json_read(const char *file, struct txf_load *L)
+{
+    char *buf, path[160] = "";
+    long sz;
+    int rc = 0;
+    FILE *fp = fopen(file, "rb");
+
+    if (!fp) {
+        warn("open %s", file);
+        return -1;
+    }
+    if (fseek(fp, 0, SEEK_END) != 0 || (sz = ftell(fp)) < 0) {
+        warn("stat %s", file);
+        fclose(fp);
+        return -1;
+    }
+    rewind(fp);
+    if (sz > 256 * 1024) {
+        warnx("%s: implausibly large for a TX FIR file (%ld bytes)", file, sz);
+        fclose(fp);
+        return -1;
+    }
+    buf = malloc((size_t)sz + 1);
+    if (!buf) {
+        fclose(fp);
+        warnx("out of memory");
+        return -1;
+    }
+    if (fread(buf, 1, (size_t)sz, fp) != (size_t)sz) {
+        warn("read %s", file);
+        free(buf);
+        fclose(fp);
+        return -1;
+    }
+    fclose(fp);
+    buf[sz] = '\0';
+
+    memset(L, 0, sizeof *L);
+    const char *end = js_value(buf, buf + sz, path, sizeof path, 0,
+                               txf_json_leaf, L, &rc);
+    if (!end) {
+        warnx("%s: JSON parse error", file);
+        free(buf);
+        return -1;
+    }
+    end = js_ws(end, buf + sz);
+    if (end != buf + sz) {
+        warnx("%s: trailing data after the top-level object", file);
+        free(buf);
+        return -1;
+    }
+    free(buf);
+    return rc ? -1 : 0;
 }
 
 static void
@@ -1262,6 +1893,29 @@ usage(const char *argv0)
         "                   table does not describe the board\n"
         "                   (always shown in the default human report)\n"
         "  -h, --help       Show this help and exit\n"
+        "\n"
+        "TX FIR (LNmTECR0 -- the six fields the DPC serdes_* properties and\n"
+        "the kernel's lynx_28g_proto_conf[] both program):\n"
+        "      --tx-fir             Report TECR0 for every Ethernet lane of the\n"
+        "                           selected block(s), decoded. Read-only\n"
+        "      --tx-fir-json        With --tx-fir, emit JSON instead of a table.\n"
+        "                           Round-trips: feed it back with --tx-fir-load\n"
+        "      --tx-fir-set SPEC    Apply SPEC to the port group containing --lane,\n"
+        "                           or to every Ethernet port of --block N. One of\n"
+        "                           the two is required -- there is no implicit\n"
+        "                           'all lanes'. SPEC is key=value[,key=value];\n"
+        "                           keys are tecr0, eq_type, sgn_preq, preq,\n"
+        "                           sgn_post1q, post1q, amp_red, decimal or 0x,\n"
+        "                           later keys winning. BOUNCES THE LINK\n"
+        "      --tx-fir-load FILE   Same, from a JSON file keyed sdN -> LNx\n"
+        "      --dry-run            Print the writes without performing them\n"
+        "\n"
+        "  The unit of work is the PORT GROUP, not the lane: RM SS26.10.4.1\n"
+        "  requires halt -> change -> reset with the group's master source-clock\n"
+        "  lane reset last, so naming one lane of the 100G tunes all four.\n"
+        "  Grouping is read from silicon (GCR0[PORT_LN0_B]/[PORT_RST_LEFT]), so a\n"
+        "  PBI- or U-Boot-reshaped block is followed correctly. Non-Ethernet\n"
+        "  lanes are refused: TECR0 is read-only under PCIe and SATA.\n"
         "\n"
         "Lynx-28G RX diagnostics (default block 1):\n"
         "      --eq-bins            RX equalization snapshot: 9 bins per lane\n"
@@ -1289,9 +1943,12 @@ main(int argc, char **argv)
     int diag_lane = -1;
     uint32_t js_mode = TST_PIJITTER;
     unsigned js_step = 8, js_dwell = 2000;
+    bool do_txfir = false, txfir_json = false, dry_run = false;
+    const char *txfir_set = NULL, *txfir_load = NULL;
 
     enum { OPT_EQBINS = 1000, OPT_JS, OPT_LANE, OPT_JSMODE, OPT_JSSTEP,
-           OPT_JSDWELL, OPT_STAGES, OPT_FECMAC, OPT_FEC, OPT_KICK, OPT_FORCE };
+           OPT_JSDWELL, OPT_STAGES, OPT_FECMAC, OPT_FEC, OPT_KICK, OPT_FORCE,
+           OPT_TXFIR, OPT_TXFIRJSON, OPT_TXFIRSET, OPT_TXFIRLOAD, OPT_DRYRUN };
     static const struct option longopts[] = {
         { "block",        required_argument, NULL, 'b' },
         { "quiet",        no_argument,       NULL, 'q' },
@@ -1299,6 +1956,11 @@ main(int argc, char **argv)
         { "stages",       no_argument,       NULL, OPT_STAGES },
         { "rx-kick",      no_argument,       NULL, OPT_KICK },
         { "force",        no_argument,       NULL, OPT_FORCE },
+        { "tx-fir",       no_argument,       NULL, OPT_TXFIR },
+        { "tx-fir-json",  no_argument,       NULL, OPT_TXFIRJSON },
+        { "tx-fir-set",   required_argument, NULL, OPT_TXFIRSET },
+        { "tx-fir-load",  required_argument, NULL, OPT_TXFIRLOAD },
+        { "dry-run",      no_argument,       NULL, OPT_DRYRUN },
         { "fec",          no_argument,       NULL, OPT_FEC },
         { "fec-mac",      required_argument, NULL, OPT_FECMAC },
         { "eq-bins",      no_argument,       NULL, OPT_EQBINS },
@@ -1322,6 +1984,11 @@ main(int argc, char **argv)
         case OPT_STAGES: want_stages = true; break;
         case OPT_KICK:  do_kick = true; break;
         case OPT_FORCE: kick_force = true; break;
+        case OPT_TXFIR:      do_txfir = true; break;
+        case OPT_TXFIRJSON:  txfir_json = true; do_txfir = true; break;
+        case OPT_TXFIRSET:   txfir_set = optarg; break;
+        case OPT_TXFIRLOAD:  txfir_load = optarg; break;
+        case OPT_DRYRUN:     dry_run = true; break;
         case OPT_FEC: do_fec = true; break;
         case OPT_FECMAC:
             fec_mac = atoi(optarg);
@@ -1357,12 +2024,139 @@ main(int argc, char **argv)
     }
 
     bool diag = do_eqbins || do_js || fec_mac > 0 || do_fec || do_kick;
+    bool txfir_write = txfir_set || txfir_load;
     if (do_js && diag_lane < 0)
         errx(EXIT_USAGE, "--jitter-scope needs --lane");
+    if (txfir_set && txfir_load)
+        errx(EXIT_USAGE, "--tx-fir-set and --tx-fir-load are mutually exclusive");
+    if (do_txfir && txfir_write)
+        errx(EXIT_USAGE, "--tx-fir reports, --tx-fir-set/--tx-fir-load write; "
+                         "run them as two commands so the before/after is explicit");
+    if (txfir_load && diag_lane >= 0)
+        errx(EXIT_USAGE, "--tx-fir-load names its own lanes; --lane is meaningless");
+    /*
+     * A bare --tx-fir-set would walk every Ethernet lane of the default
+     * block and bounce each link in turn. Make the blast radius explicit
+     * rather than convenient.
+     */
+    if (txfir_set && diag_lane < 0 && filter_block < 0)
+        errx(EXIT_USAGE, "--tx-fir-set needs --lane (one port group) or "
+                         "--block N (every Ethernet port of that block)");
 
-    int fd = open("/dev/mem", (diag ? O_RDWR : O_RDONLY) | O_SYNC);
+    struct txf_load txf_file;
+    struct tx_fir  txf_spec;
+
+    if (txfir_load && txf_json_read(txfir_load, &txf_file) != 0)
+        return EXIT_FAILURE;
+    if (txfir_set && tx_fir_parse_spec(txfir_set, &txf_spec) != 0)
+        return EXIT_USAGE;
+
+    int fd = open("/dev/mem",
+                  ((diag || txfir_write) ? O_RDWR : O_RDONLY) | O_SYNC);
     if (fd < 0)
         err(EXIT_FAILURE, "open /dev/mem (need root)");
+
+    if (do_txfir) {
+        int rc = 0;
+        bool firstb = true;
+
+        if (txfir_json)
+            printf("{");
+        for (int b = 1; b <= 3; b++) {
+            volatile uint32_t *sd;
+            bool firstl = true;
+
+            if (filter_block > 0 && b != filter_block)
+                continue;
+            sd = map_phys(fd, sd_base[b], SD_MAP_LEN);
+            if (!sd) { rc = 1; continue; }
+
+            if (!txfir_json && m == MODE_HUMAN)
+                printf("\nSD%d TX FIR (LNmTECR0):\n", b);
+            for (int l = 0; l < NUM_LANES; l++) {
+                if (!is_eth(proto_sel(lane_reg(sd, OFF_LANE_GCR0, l))))
+                    continue;
+                if (diag_lane >= 0 && l != diag_lane)
+                    continue;
+                if (txfir_json) {
+                    if (firstl) {
+                        printf("%s\n  \"sd%d\": {", firstb ? "" : ",", b);
+                        firstb = false;
+                    }
+                    tx_fir_json_lane(b, sd, l, firstl);
+                    firstl = false;
+                } else {
+                    tx_fir_print_lane(b, sd, l, m);
+                }
+            }
+            if (txfir_json && !firstl)
+                printf("\n  }");
+        }
+        if (txfir_json)
+            printf("\n}\n");
+        close(fd);
+        return rc ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+
+    if (txfir_write) {
+        const struct txf_load *L = &txf_file;
+        const struct tx_fir *spec = &txf_spec;
+        int rc = 0;
+
+        printf("TX FIR write (RM SS26.10.4.1 halt -> change -> reset, master "
+               "lane last).%s\n", dry_run ? "  --dry-run" : "  THIS BOUNCES THE LINK.");
+
+        for (int b = 1; b <= 3; b++) {
+            volatile uint32_t *sd;
+            bool done[NUM_LANES] = { false };
+
+            /* --tx-fir-set targets one block: the named one, else the
+             * same default block 1 the RX diagnostics use. --tx-fir-load
+             * names its own blocks and visits all of them. */
+            if (txfir_set && b != (filter_block > 0 ? filter_block : 1))
+                continue;
+            if (txfir_load && filter_block > 0 && b != filter_block)
+                continue;
+
+            sd = map_phys_prot(fd, sd_base[b], SD_MAP_LEN,
+                               PROT_READ | PROT_WRITE);
+            if (!sd) { rc = 1; continue; }
+
+            for (int l = 0; l < NUM_LANES; l++) {
+                const struct tx_fir *want;
+                struct port_grp g;
+                bool ok = true;
+
+                if (done[l])
+                    continue;
+                if (txfir_load) {
+                    if (!L->present[b][l])
+                        continue;
+                    want = &L->lane[b][l];
+                } else {
+                    if (diag_lane >= 0 && l != diag_lane)
+                        continue;
+                    want = spec;
+                }
+
+                /* Whole group or nothing: a partial write would leave the
+                 * group's lanes disagreeing about their own reset. */
+                tx_fir_group(sd, l, &g);
+                for (int i = 0; i < g.n; i++) {
+                    if (!tx_fir_lane_ok(sd, b, g.first + i))
+                        ok = false;
+                    done[g.first + i] = true;
+                }
+                if (!ok) { rc = 1; continue; }
+
+                rc |= tx_fir_apply_group(sd, b, &g, want, dry_run);
+            }
+        }
+        if (dry_run)
+            printf("--dry-run: nothing written\n");
+        close(fd);
+        return rc ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
 
     if (do_kick) {
         int rc = 0;
