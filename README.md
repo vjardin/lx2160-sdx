@@ -1,8 +1,6 @@
-# lx2160-sdx
+# lx2160-* tool box
 
 Read LX2160A SerDes block per-lane status from Linux userland.
-
-This project builds three tools:
 
 - `lx2160-sdx` — the generic SerDes walker: PLL / lane / CDR state
   checks
@@ -11,6 +9,10 @@ This project builds three tools:
 - `lx2160-eth` — the Ethernet ports: every SerDes lane in an Ethernet
   mode
 - `lx2160-sata` — SATA lanes + AHCI if any
+
+and handle the MC's microco with:
+
+- `lx2160-mc` — status/stop/start MC without a reboot
 
 ## What it is
 
