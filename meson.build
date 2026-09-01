@@ -49,3 +49,9 @@ executable('lx2160-linkmon',
   link_args : link_args,
   install : true,
 )
+
+executable('lx2160-mc',
+  'src/lx2160-mc.c',
+  link_args : link_args,
+  install : true,
+)
