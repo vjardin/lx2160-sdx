@@ -40,7 +40,7 @@
 #define SD1_BASE        0x01EA0000UL
 #define SD2_BASE        0x01EB0000UL
 #define SD3_BASE        0x01EC0000UL
-#define SD_BLOCK_MAP_LEN 0x1000UL   /* 4 KiB covers all decoded registers (highest = lane 7 RECR4 @ 0xF54) */
+#define SD_BLOCK_MAP_LEN 0x1000UL   /* 4 KiB covers all decoded registers (highest = lane 7 RECR4 @ 0xF60) */
 
 /* Block-level register offsets */
 #define OFF_RSTCTL          0x000
