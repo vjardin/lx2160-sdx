@@ -1512,6 +1512,8 @@ static int tx_fir_apply_group(volatile uint32_t *sd, int sd_idx,
         return 0;
     }
 
+    bool was_up = tx_fir_port_up(sd_idx, sd, g);
+
     for (int i = 0; i < g->n; i++) { /* halt */
         int l = g->first + i;
         lane_wr(sd, OFF_LANE_TRSTCTL, l,
@@ -1551,6 +1553,11 @@ static int tx_fir_apply_group(volatile uint32_t *sd, int sd_idx,
     printf("  applied to LN%c-LN%c (master LN%c reset last); link bounced\n",
            'A'+g->first, 'A'+g->first+g->n-1, 'A'+g->master);
 
+    if (!was_up) {
+        printf("  LN%c-LN%c was down before the change, not waiting for it\n",
+               'A'+g->first, 'A'+g->first+g->n-1);
+        return 0;
+    }
     return tx_fir_relink(sd, sd_idx, g);
 }
 
