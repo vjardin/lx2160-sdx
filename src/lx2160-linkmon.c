@@ -1,6 +1,10 @@
 /*
  * lx2160-linkmon — LX2160A Ethernet link-flap monitor with SerDes
  *
+ * Ports are found at runtime: every dpni of the fsl-mc bus, its dpmac
+ * from the netdev's phys_port_name (restool as a fallback), and the
+ * dpmac's SerDes lanes from mac_lanes[].
+ *
  * Run (root required, /dev/mem access):
  *   ./lx2160-linkmon                       # monitor
  *   ./lx2160-linkmon --log /run/linkmon.log
@@ -42,6 +46,18 @@
 
 #define SD_MAP_LEN         0x1000UL
 static const uint64_t sd_base[4] = { 0, 0x01EA0000UL, 0x01EB0000UL, 0x01EC0000UL };
+
+/*
+ * DCFG RCWSR27 (LX2160ARM §9.3.1.39): EC1_PMUX [1:0], EC2_PMUX [3:2].
+ * 0b00 puts WRIOP MAC 17 / MAC 18 on the RGMII pins (§4.9.8.9), any other
+ * value leaves the MAC to SerDes 2.
+ */
+#define DCFG_BASE          0x01E00000UL
+#define DCFG_MAP_LEN       0x1000UL
+#define OFF_RCWSR27        0x168
+#define EC1_PMUX(r)        ((r) & 0x3u)
+#define EC2_PMUX(r)        (((r) >> 2) & 0x3u)
+#define PMUX_RGMII         0x0u
 
 #define OFF_PLLFRSTCTL     0x400
 #define OFF_PLLSRSTCTL     0x500
@@ -103,7 +119,6 @@ struct lane_snap {
 struct sd_block {
     volatile uint32_t *map;
     bool     present;
-    bool     eth_lane[NUM_LANES];
     struct lane_snap snap[NUM_LANES];
     uint32_t pllf, plls;
 };
@@ -144,18 +159,25 @@ static struct phy_ev *ring_push(void)
 }
 
 /*
- * dpni -> the SerDes lanes physically behind it.
+ * A port is a dpni, its dpmac and the SerDes lanes physically behind it.
+ * Which dpmac a dpni drives is the DPL's choice, so it is read at
+ * runtime; only the dpmac -> lanes half is a table (mac_lanes[]).
  *
- * Override with --map dpni.N=SD:lanes , e.g. --map dpni.2=1:0-3
+ * Override with --map dpni.N=SD:lanes , e.g. --map dpni.1=1:0-3
  */
 #define MAX_PORTS 16
 #define MAX_PORT_LANES 8
 
 struct port {
     int  dpni;
+    int  mac;                    /* dpmac id, 0 = not known (yet) */
     int  sd;
-    int  nlanes;
+    int  nlanes;                 /* 0 = no lanes: the port is not monitored */
     int  lane[MAX_PORT_LANES];
+    bool mapped;                 /* lanes given by --map */
+    bool settled;                /* lanes decided, nothing left to look up */
+    bool restool_tried;
+    char why[112];               /* why a settled port has no lanes */
     char ifname[IFNAMSIZ];
     bool have_if;
     /* last known netdev state, for edge detection */
@@ -177,18 +199,40 @@ static unsigned read_carrier_changes(const char *ifname);
 static struct port ports[MAX_PORTS];
 static int nports;
 
-static const struct port boards_profile[] = {
-    { .dpni = 2,  .sd = 1, .nlanes = 4, .lane = { 0, 1, 2, 3 } },  /* dpmac.2 100G CAUI-4 */
-    { .dpni = 10, .sd = 1, .nlanes = 1, .lane = { 4 } },           /* LNE -> dpmac.6 */
-    { .dpni = 9,  .sd = 1, .nlanes = 1, .lane = { 5 } },           /* LNF -> dpmac.5 */
-    { .dpni = 8,  .sd = 1, .nlanes = 1, .lane = { 6 } },           /* LNG -> dpmac.4 */
-    { .dpni = 1,  .sd = 1, .nlanes = 1, .lane = { 7 } },           /* LNH -> dpmac.3 */
-    { .dpni = 6,  .sd = 2, .nlanes = 1, .lane = { 1 } },           /* SGMII.12 -> dpmac.12 */
-    { .dpni = 7,  .sd = 2, .nlanes = 1, .lane = { 3 } },           /* SGMII.18 -> dpmac.18 */
-    { .dpni = 5,  .sd = 2, .nlanes = 1, .lane = { 5 } },           /* SGMII.16 -> dpmac.16 */
-    { .dpni = 3,  .sd = 2, .nlanes = 1, .lane = { 6 } },           /* USXGMII.13 -> dpmac.13 */
-    { .dpni = 4,  .sd = 2, .nlanes = 1, .lane = { 7 } },           /* USXGMII.14 -> dpmac.14 */
+/* --map entries: dpni, sd and lanes only */
+static struct port maps[MAX_PORTS];
+static int nmaps;
+
+/*
+ * dpmac -> the SerDes lanes it sits on. Lanes are register indices
+ * (LNA = 0x800, what lane_name() prints), not the letters of the RM
+ * protocol tables.
+ */
+struct mac_lanes {
+    int mac;
+    int sd;
+    int nlanes;
+    int lane[4];
 };
+
+/* XXX board specific, the following is for my case/board, to be improved */
+static const struct mac_lanes mac_lanes[] = {
+    { .mac = 2,  .sd = 1, .nlanes = 4, .lane = { 0, 1, 2, 3 } },  /* 100G / 40G */
+    { .mac = 1,  .sd = 1, .nlanes = 4, .lane = { 4, 5, 6, 7 } },  /* 100G / 40G */
+    { .mac = 6,  .sd = 1, .nlanes = 1, .lane = { 4 } },            /* 25G / 10G: MAC 1's lanes split */
+    { .mac = 5,  .sd = 1, .nlanes = 1, .lane = { 5 } },
+    { .mac = 4,  .sd = 1, .nlanes = 1, .lane = { 6 } },
+    { .mac = 3,  .sd = 1, .nlanes = 1, .lane = { 7 } },
+    { .mac = 12, .sd = 2, .nlanes = 1, .lane = { 1 } },            /* SGMII.12 */
+    { .mac = 17, .sd = 2, .nlanes = 1, .lane = { 2 } },            /* SGMII.17, unless EC1 is RGMII */
+    { .mac = 18, .sd = 2, .nlanes = 1, .lane = { 3 } },            /* SGMII.18, unless EC2 is RGMII */
+    { .mac = 16, .sd = 2, .nlanes = 1, .lane = { 5 } },            /* SGMII.16 */
+    { .mac = 13, .sd = 2, .nlanes = 1, .lane = { 6 } },            /* USXGMII.13 */
+    { .mac = 14, .sd = 2, .nlanes = 1, .lane = { 7 } },            /* USXGMII.14 */
+};
+
+static uint32_t rcwsr27;
+static bool     have_rcwsr27;
 
 static FILE *out;
 static FILE *logfp;
@@ -552,7 +596,6 @@ lanes:
             cur.gcr0    = lane_rd(b->map, OFF_LANE_GCR0, l);
             cur.trstctl = lane_rd(b->map, OFF_LANE_TRSTCTL, l);
             cur.tecr0   = lane_rd(b->map, OFF_LANE_TECR0, l);
-            b->eth_lane[l] = is_eth_proto(proto_sel(cur.gcr0));
 
             if (!((cur.rrstctl ^ old->rrstctl) & RRST_WATCH) &&
                 !((cur.trstctl ^ old->trstctl) & TRST_WATCH) &&
@@ -624,11 +667,17 @@ static int nl_open(void)
     return fd;
 }
 
+/* A port is monitored once it has both a netdev and lanes. */
+static bool port_watched(const struct port *p)
+{
+    return p->have_if && p->nlanes > 0;
+}
+
 static struct port *port_by_ifname(const char *name)
 {
     int i;
     for (i = 0; i < nports; i++)
-        if (ports[i].have_if && strcmp(ports[i].ifname, name) == 0)
+        if (port_watched(&ports[i]) && strcmp(ports[i].ifname, name) == 0)
             return &ports[i];
     return NULL;
 }
@@ -850,6 +899,239 @@ static bool prime_port_state(struct port *p)
     return true;
 }
 
+/*
+ * The dpmac a dpni drives, first match wins (as hwconfig's ethnames.sh):
+ *   1. phys_port_name "p<n>": dpaa2-eth reports the DPMAC id as the
+ *      devlink port number; "p0" is a kernel without that patch.
+ *   2. restool's endpoint, asked once per port.
+ * 0 when neither knows: no netdev yet, no restool, or no dpmac endpoint.
+ */
+static int dpni_mac(struct port *p)
+{
+    char buf[32], cmd[64], line[160];
+    FILE *fp;
+    int v = 0;
+
+    if (p->have_if && read_sysfs_net(p->ifname, "phys_port_name", buf, sizeof buf) &&
+        sscanf(buf, "p%d", &v) == 1 && v > 0)
+        return v;
+    if (p->restool_tried)
+        return 0;
+    p->restool_tried = true;
+
+    snprintf(cmd, sizeof cmd, "restool dpni info dpni.%d 2>/dev/null", p->dpni);
+    fp = popen(cmd, "r");
+    if (!fp)
+        return 0;
+    v = 0;
+    while (fgets(line, sizeof line, fp)) {
+        int m;
+
+        if (!v && sscanf(line, "endpoint: dpmac.%d", &m) == 1 && m > 0)
+            v = m;
+    }
+    pclose(fp);
+    return v;
+}
+
+/*
+ * Decide p's lanes: mac_lanes[], unless the EC pin mux has the MAC on
+ * RGMII, and only if every lane's PROTO_SEL is an Ethernet class. A
+ * port given by --map keeps its lanes. Leaves the reason in p->why.
+ */
+static void port_set_lanes(struct port *p)
+{
+    const struct mac_lanes *ml = NULL;
+    size_t i;
+    int j;
+
+    p->settled = true;
+    if (p->mapped)
+        return;
+    if (!p->mac) {
+        snprintf(p->why, sizeof p->why,
+                 "no dpmac found (phys_port_name, restool), give the lanes with --map");
+        return;
+    }
+    if (p->mac == 17 || p->mac == 18) {
+        uint32_t pmux = p->mac == 17 ? EC1_PMUX(rcwsr27) : EC2_PMUX(rcwsr27);
+
+        if (!have_rcwsr27) {
+            snprintf(p->why, sizeof p->why,
+                     "RCWSR27 unreadable: RGMII or SGMII unknown, give the lanes with --map");
+            return;
+        }
+        if (pmux == PMUX_RGMII) {
+            snprintf(p->why, sizeof p->why, "RGMII (EC%d_PMUX = 0), not on SerDes",
+                     p->mac - 16);
+            return;
+        }
+    }
+    for (i = 0; i < sizeof mac_lanes / sizeof mac_lanes[0]; i++)
+        if (mac_lanes[i].mac == p->mac)
+            ml = &mac_lanes[i];
+    if (!ml) {
+        snprintf(p->why, sizeof p->why,
+                 "no lane entry for dpmac.%d, give the lanes with --map", p->mac);
+        return;
+    }
+    if (!blk[ml->sd].present) {
+        snprintf(p->why, sizeof p->why, "SD%d is not mapped", ml->sd);
+        return;
+    }
+    for (j = 0; j < ml->nlanes; j++) {
+        uint32_t ps = proto_sel(lane_rd(blk[ml->sd].map, OFF_LANE_GCR0, ml->lane[j]));
+
+        if (!is_eth_proto(ps)) {
+            snprintf(p->why, sizeof p->why,
+                     "SD%d %s PROTO_SEL 0x%02x is not Ethernet, give the lanes with --map",
+                     ml->sd, lane_name(ml->lane[j]), ps);
+            return;
+        }
+    }
+    p->sd = ml->sd;
+    p->nlanes = ml->nlanes;
+    for (j = 0; j < ml->nlanes; j++)
+        p->lane[j] = ml->lane[j];
+}
+
+/*
+ * Add p's lanes to the sampled set, primed with their current values so
+ * that the first sample does not read as a change. A block's PLLs are
+ * primed with its first lane.
+ */
+static void watch_lanes(const struct port *p)
+{
+    struct sd_block *b = &blk[p->sd];
+    int j;
+
+    if (!b->present)
+        return;
+    if (!mon_lane[p->sd]) {
+        b->pllf = rd32(b->map, OFF_PLLFRSTCTL);
+        b->plls = rd32(b->map, OFF_PLLSRSTCTL);
+    }
+    for (j = 0; j < p->nlanes; j++) {
+        int l = p->lane[j];
+        struct lane_snap *s = &b->snap[l];
+
+        if (mon_lane[p->sd] & (1u << l))
+            continue;
+        s->gcr0    = lane_rd(b->map, OFF_LANE_GCR0, l);
+        s->trstctl = lane_rd(b->map, OFF_LANE_TRSTCTL, l);
+        s->rrstctl = lane_rd(b->map, OFF_LANE_RRSTCTL, l);
+        s->tecr0   = lane_rd(b->map, OFF_LANE_TECR0, l);
+        mon_lane[p->sd] |= (uint8_t)(1u << l);
+    }
+}
+
+/*
+ * Fill in what p still lacks: netdev, dpmac, lanes. A port without a
+ * netdev is retried later, since phys_port_name comes with it. Its lanes
+ * are sampled as soon as they are known, netdev or not, so that a carrier
+ * loss can be read against what they did before. Returns true when p has
+ * just become monitored.
+ */
+static bool port_resolve(struct port *p)
+{
+    bool was = port_watched(p);
+
+    if (!p->have_if &&
+        resolve_dpni_ifname(p->dpni, p->ifname, sizeof p->ifname)) {
+        p->have_if = true;
+        prime_port_state(p);
+    }
+    if (!p->mac)
+        p->mac = dpni_mac(p);
+    if (!p->settled && (p->mac || p->have_if || p->mapped))
+        port_set_lanes(p);
+    if (p->nlanes > 0)
+        watch_lanes(p);
+    return !was && port_watched(p);
+}
+
+static int cmp_int(const void *a, const void *b)
+{
+    int x = *(const int *)a, y = *(const int *)b;
+
+    return (x > y) - (x < y);
+}
+
+/* One port per dpni of the fsl-mc bus, in dpni order. */
+static void discover_ports(void)
+{
+    int ids[MAX_PORTS];
+    int n = 0, i;
+    DIR *d;
+    struct dirent *de;
+
+    d = opendir("/sys/bus/fsl-mc/devices");
+    if (!d) {
+        warn("/sys/bus/fsl-mc/devices");
+        return;
+    }
+    while ((de = readdir(d))) {
+        char *end;
+        long v;
+
+        if (strncmp(de->d_name, "dpni.", 5) != 0)
+            continue;
+        v = strtol(de->d_name + 5, &end, 10);
+        if (end == de->d_name + 5 || *end != '\0' || v < 0)
+            continue;
+        if (n == MAX_PORTS) {
+            warnx("more than %d dpni, the others are not monitored", MAX_PORTS);
+            break;
+        }
+        ids[n++] = (int)v;
+    }
+    closedir(d);
+
+    qsort(ids, (size_t)n, sizeof ids[0], cmp_int);
+    for (i = 0; i < n; i++)
+        ports[nports++] = (struct port){ .dpni = ids[i] };
+}
+
+/* --map wins over the table for its dpni, and adds a dpni not found. */
+static void apply_maps(void)
+{
+    int i, j;
+
+    for (i = 0; i < nmaps; i++) {
+        struct port *p = NULL;
+
+        for (j = 0; j < nports; j++)
+            if (ports[j].dpni == maps[i].dpni)
+                p = &ports[j];
+        if (!p) {
+            if (nports == MAX_PORTS) {
+                warnx("--map dpni.%d: more than %d ports, ignored", maps[i].dpni, MAX_PORTS);
+                continue;
+            }
+            p = &ports[nports++];
+            *p = (struct port){ .dpni = maps[i].dpni };
+        }
+        p->sd = maps[i].sd;
+        p->nlanes = maps[i].nlanes;
+        for (j = 0; j < maps[i].nlanes; j++)
+            p->lane[j] = maps[i].lane[j];
+        p->mapped = true;
+    }
+}
+
+static bool read_rcwsr27(int memfd)
+{
+    void *m = mmap(NULL, DCFG_MAP_LEN, PROT_READ, MAP_SHARED, memfd, (off_t)DCFG_BASE);
+
+    if (m == MAP_FAILED) {
+        warn("mmap DCFG at 0x%08lx", DCFG_BASE);
+        return false;
+    }
+    rcwsr27 = rd32((const volatile uint32_t *)m, OFF_RCWSR27);
+    munmap(m, DCFG_MAP_LEN);
+    return true;
+}
+
 static volatile uint32_t *map_sd(int fd, int s)
 {
     void *m = mmap(NULL, SD_MAP_LEN, PROT_READ, MAP_SHARED, fd,
@@ -908,9 +1190,9 @@ static int parse_map(const char *arg)
     }
     if (p.nlanes == 0)
         return -1;
-    if (nports >= MAX_PORTS)
+    if (nmaps >= MAX_PORTS)
         return -1;
-    ports[nports++] = p;
+    maps[nmaps++] = p;
     return 0;
 }
 
@@ -939,7 +1221,9 @@ static void usage(const char *argv0)
         "                       only moves where SW-RESET stops and MAC-LATCH\n"
         "                       starts - it never hides the evidence.\n"
         "  -l, --log FILE       append every line to FILE as well as stdout\n"
-        "  -m, --map SPEC       dpni.N=SD:lanes (repeatable)\n"
+        "  -m, --map SPEC       dpni.N=SD:lanes (repeatable): the lanes of dpni.N,\n"
+        "                       instead of those of its dpmac. The other dpni\n"
+        "                       are still mapped through their dpmac.\n"
         "  -e, --on-event CMD   run CMD <ifname> <up|down> <verdict> on each event\n"
         "  -1, --once           print the baseline snapshot and exit\n"
         "  -h, --help           show this help and exit\n"
@@ -957,7 +1241,7 @@ int main(int argc, char **argv)
 {
     int memfd, nlfd, opt, s, i;
     long interval_us = 1000;
-    bool once = false, user_map = false;
+    bool once = false;
     const char *logpath = NULL;
     uint64_t t;
 
@@ -992,7 +1276,6 @@ int main(int argc, char **argv)
             break;
         case 'l': logpath = optarg; break;
         case 'm':
-            if (!user_map) { nports = 0; user_map = true; }
             if (parse_map(optarg) < 0)
                 errx(EXIT_USAGE, "bad --map '%s' (want dpni.N=SD:lanes)", optarg);
             break;
@@ -1001,12 +1284,6 @@ int main(int argc, char **argv)
         case 'h': usage(argv[0]); return EXIT_SUCCESS;
         default:  usage(argv[0]); return EXIT_USAGE;
         }
-    }
-
-    /* XXX */
-    if (!user_map) {
-        nports = (int)(sizeof boards_profile / sizeof boards_profile[0]);
-        memcpy(ports, boards_profile, sizeof boards_profile);
     }
 
     if (logpath) {
@@ -1026,24 +1303,20 @@ int main(int argc, char **argv)
             warn("mmap SD%d at 0x%08" PRIx64, s, sd_base[s]);
     }
 
-    /* Resolve dpni -> netdev once; names are discovery-ordered, dpni is not. */
-    for (i = 0; i < nports; i++) {
-        ports[i].have_if = resolve_dpni_ifname(ports[i].dpni, ports[i].ifname,
-                                               sizeof ports[i].ifname);
-        if (ports[i].have_if)
-            prime_port_state(&ports[i]);
-    }
+    have_rcwsr27 = read_rcwsr27(memfd);
+
+    /*
+     * dpni -> netdev, dpmac and lanes. Names are discovery-ordered, dpni
+     * is not. The hot loop only touches lanes some port sits on.
+     */
+    discover_ports();
+    apply_maps();
+    for (i = 0; i < nports; i++)
+        port_resolve(&ports[i]);
 
     signal(SIGCHLD, SIG_IGN);
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
-
-    /* The hot loop only touches lanes some port actually sits on. */
-    for (i = 0; i < nports; i++) {
-        int j;
-        for (j = 0; j < ports[i].nlanes; j++)
-            mon_lane[ports[i].sd] |= (uint8_t)(1u << ports[i].lane[j]);
-    }
 
     /* Baseline: prime the snapshots without emitting a wall of fake events. */
     t = now_ns(CLOCK_BOOTTIME);
@@ -1051,29 +1324,42 @@ int main(int argc, char **argv)
     ring_head = ring_count = 0;
 
     {
-        int nl = 0;
+        int nl = 0, np = 0;
         for (s = 1; s <= NUM_SD; s++)
             for (i = 0; i < NUM_LANES; i++)
                 if (mon_lane[s] & (1u << i))
                     nl++;
+        for (i = 0; i < nports; i++)
+            if (ports[i].nlanes > 0)
+                np++;
         emit(t, "lx2160-linkmon start: interval=%ldus window=%" PRIu64 "ms ports=%d lanes=%d",
-             interval_us, (uint64_t)(window_ns / 1000000ull), nports, nl);
+             interval_us, (uint64_t)(window_ns / 1000000ull), np, nl);
     }
     for (i = 0; i < nports; i++) {
         const struct port *p = &ports[i];
         char lanes[64] = "";
+        char mac[16] = "dpmac.?";
         int j;
 
+        if (p->mac)
+            snprintf(mac, sizeof mac, "dpmac.%d", p->mac);
+        if (p->nlanes == 0) {
+            emit_cont("dpni.%-2d  %-8s  %-6s  not monitored: %s", p->dpni, mac,
+                      p->have_if ? p->ifname : "-",
+                      p->why[0] ? p->why : "no netdev yet to read its dpmac from");
+            continue;
+        }
         for (j = 0; j < p->nlanes; j++)
             snprintf(lanes + strlen(lanes), sizeof lanes - strlen(lanes),
                      "%s%s", j ? "," : "", lane_name(p->lane[j]));
         if (!p->have_if) {
-            emit_cont("dpni.%-2d  SD%d %-16s  (no netdev -- not instantiated)",
-                      p->dpni, p->sd, lanes);
+            emit_cont("dpni.%-2d  %-8s  SD%d %-16s  (no netdev -- not instantiated)",
+                      p->dpni, mac, p->sd, lanes);
             continue;
         }
-        emit_cont("dpni.%-2d  SD%d %-16s  %-6s  carrier=%d admin_up=%d",
-                  p->dpni, p->sd, lanes, p->ifname, p->carrier, p->admin_up);
+        emit_cont("dpni.%-2d  %-8s  SD%d %-16s  %-6s  carrier=%d admin_up=%d%s",
+                  p->dpni, mac, p->sd, lanes, p->ifname, p->carrier, p->admin_up,
+                  p->mapped ? "  (--map)" : "");
         dump_port_lanes(p);
     }
 
@@ -1098,17 +1384,18 @@ int main(int argc, char **argv)
 
         if ((reslv_tick++ % 512) == 0) {
             for (i = 0; i < nports; i++) {
-                if (ports[i].have_if)
+                struct port *p = &ports[i];
+
+                if (p->have_if && p->settled)
                     continue;
-                if (!resolve_dpni_ifname(ports[i].dpni, ports[i].ifname,
-                                         sizeof ports[i].ifname))
-                    continue;
-                ports[i].have_if = true;
-                prime_port_state(&ports[i]);
-                emit(now_ns(CLOCK_BOOTTIME),
-                     "%-6s (dpni.%d)  appeared: carrier=%d admin_up=%d",
-                     ports[i].ifname, ports[i].dpni,
-                     ports[i].carrier, ports[i].admin_up);
+                if (port_resolve(p))
+                    emit(now_ns(CLOCK_BOOTTIME),
+                         "%-6s (dpni.%d)  appeared: carrier=%d admin_up=%d",
+                         p->ifname, p->dpni, p->carrier, p->admin_up);
+                else if (p->have_if && p->settled && p->nlanes == 0)
+                    emit(now_ns(CLOCK_BOOTTIME),
+                         "%-6s (dpni.%d)  appeared, not monitored: %s",
+                         p->ifname, p->dpni, p->why);
             }
         }
 
@@ -1123,7 +1410,7 @@ int main(int argc, char **argv)
 
     emit(now_ns(CLOCK_BOOTTIME), "lx2160-linkmon stop");
     for (i = 0; i < nports; i++)
-        if (ports[i].have_if)
+        if (port_watched(&ports[i]))
         {
             unsigned kern = read_carrier_changes(ports[i].ifname) -
                             ports[i].cc_start;
